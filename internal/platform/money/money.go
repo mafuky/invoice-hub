@@ -5,6 +5,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"fmt"
+	"regexp"
 
 	"github.com/shopspring/decimal"
 )
@@ -13,8 +14,14 @@ type Amount struct {
 	d decimal.Decimal
 }
 
-// Parse accepts at most two decimal places; it never rounds.
+var amountRe = regexp.MustCompile(`^-?\d{1,16}(\.\d{1,2}0*)?$`)
+
+// Parse accepts at most 16 integer digits and two significant decimal places
+// (trailing zeros are allowed, so "1.500" is valid); it never rounds.
 func Parse(s string) (Amount, error) {
+	if !amountRe.MatchString(s) {
+		return Amount{}, fmt.Errorf("money: invalid amount %q", s)
+	}
 	d, err := decimal.NewFromString(s)
 	if err != nil {
 		return Amount{}, fmt.Errorf("money: invalid amount %q: %w", s, err)

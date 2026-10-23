@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -103,6 +104,63 @@ func TestConfig_DotEnvFileAndPrecedence(t *testing.T) {
 	}
 	if _, ok := os.LookupEnv("lower"); ok {
 		t.Fatal("lowercase key must be ignored")
+	}
+
+	m, err := parseEnvFile(filepath.Join(dir, ".env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{"lower", "BAD LINE", "export INVHUB_X", "INVHUB_X", "# comment"} {
+		if _, ok := m[k]; ok {
+			t.Fatalf("key %q must not be parsed", k)
+		}
+	}
+	if m["INVHUB_MONGO_DB"] != "fromfile" {
+		t.Fatalf("parsed map: %v", m)
+	}
+}
+
+func TestConfig_EnvAboveRepoRootNotRead(t *testing.T) {
+	outer := isolate(t)
+	body := ""
+	for k, v := range required {
+		body += k + "=" + v + "\n"
+	}
+	if err := os.WriteFile(filepath.Join(outer, ".env"), []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(outer, "repo")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(inner, "go.mod"), []byte("module y\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(inner)
+	if _, err := Load(); err == nil {
+		t.Fatal(".env above the go.mod directory must not be read")
+	}
+}
+
+func TestConfig_StringRedactsSecrets(t *testing.T) {
+	isolate(t)
+	setRequired(t)
+	t.Setenv("INVHUB_MYSQL_DSN_INVOICE", "app:s3cretpw@tcp(127.0.0.1:23306)/invoice?parseTime=true")
+	t.Setenv("INVHUB_MONGO_URI", "mongodb://app:s3cretpw@127.0.0.1:37017/?authSource=admin")
+	t.Setenv("INVHUB_REDIS_PASSWORD", "s3cretpw")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := fmt.Sprintf("%v | %s | %+v", cfg, cfg, cfg)
+	if strings.Contains(out, "s3cretpw") {
+		t.Fatalf("secret leaked: %s", out)
+	}
+	if !strings.Contains(out, "app:***@tcp(127.0.0.1:23306)/invoice") {
+		t.Fatalf("unexpected redaction: %s", out)
+	}
+	if v := cfg.LogValue().String(); strings.Contains(v, "s3cretpw") {
+		t.Fatalf("LogValue leaked: %s", v)
 	}
 }
 

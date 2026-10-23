@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,6 +43,7 @@ var keyRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
 
 // Load reads the process environment, falling back to a .env file in the
 // repository root (the nearest parent directory holding go.mod).
+// An empty environment variable counts as unset.
 func Load() (Config, error) {
 	file := map[string]string{}
 	if root, ok := repoRoot(); ok {
@@ -143,4 +145,72 @@ func parseEnvFile(path string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, sc.Err()
+}
+
+// redactURL masks the password and drops the query of a DSN or URI.
+func redactURL(s string) string {
+	if s == "" {
+		return ""
+	}
+	scheme := ""
+	rest := s
+	if i := strings.Index(s, "://"); i >= 0 {
+		scheme, rest = s[:i+3], s[i+3:]
+	}
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		rest = rest[:i]
+	}
+	at := strings.LastIndexByte(rest, '@')
+	if at < 0 {
+		return scheme + rest
+	}
+	user, _, _ := strings.Cut(rest[:at], ":")
+	return scheme + user + ":***@" + rest[at+1:]
+}
+
+func redactSecret(s string) string {
+	if s == "" {
+		return ""
+	}
+	return "***"
+}
+
+func (c Config) redacted() []slog.Attr {
+	return []slog.Attr{
+		slog.String("ssh_host", c.SSHHost),
+		slog.String("ssh_port", c.SSHPort),
+		slog.String("ssh_user", c.SSHUser),
+		slog.String("remote_dir", c.RemoteDir),
+		slog.String("mysql_dsn_invoice", redactURL(c.MySQLDSNInvoice)),
+		slog.String("mysql_dsn_provider", redactURL(c.MySQLDSNProvider)),
+		slog.String("mysql_dsn_settlement", redactURL(c.MySQLDSNSettlement)),
+		slog.String("redis_addr", c.RedisAddr),
+		slog.String("redis_password", redactSecret(c.RedisPassword)),
+		slog.String("amqp_url", redactURL(c.AMQPURL)),
+		slog.String("mongo_uri", redactURL(c.MongoURI)),
+		slog.String("mongo_db", c.MongoDB),
+		slog.String("api_addr", c.APIAddr),
+		slog.String("invoice_addr", c.InvoiceAddr),
+		slog.String("provider_addr", c.ProviderAddr),
+		slog.String("settlement_addr", c.SettlementAddr),
+		slog.String("delivery_addr", c.DeliveryAddr),
+		slog.String("mock_addr", c.MockAddr),
+		slog.String("mock_url", c.MockURL),
+		slog.String("mock_callback_url", c.MockCallbackURL),
+	}
+}
+
+// LogValue keeps secrets out of structured logs.
+func (c Config) LogValue() slog.Value { return slog.GroupValue(c.redacted()...) }
+
+// String keeps secrets out of %v and %s output.
+func (c Config) String() string {
+	var b strings.Builder
+	for i, a := range c.redacted() {
+		if i > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(a.Key + "=" + a.Value.String())
+	}
+	return b.String()
 }

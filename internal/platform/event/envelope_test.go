@@ -3,6 +3,8 @@ package event
 import (
 	"encoding/json"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 func TestEnvelope_NewAndDecode(t *testing.T) {
@@ -10,8 +12,9 @@ func TestEnvelope_NewAndDecode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.EventID == "" || e.EventID[14] != '7' {
-		t.Fatalf("event id %q is not a UUIDv7", e.EventID)
+	id, err := uuid.Parse(e.EventID)
+	if err != nil || id.Version() != 7 {
+		t.Fatalf("event id %q is not a UUIDv7 (%v)", e.EventID, err)
 	}
 
 	var got map[string]string

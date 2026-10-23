@@ -59,3 +59,16 @@ func TestAmount_RejectsMoreThanTwoDecimals(t *testing.T) {
 		t.Fatalf("-0.01: %v", err)
 	}
 }
+
+func TestAmount_ParseIsBounded(t *testing.T) {
+	for _, in := range []string{"1e2", "+5", "1e999999999", "12345678901234567.00", " 1.00", "", "1.", ".5"} {
+		if _, err := Parse(in); err == nil {
+			t.Errorf("Parse(%q) should fail", in)
+		}
+	}
+	for _, in := range []string{"9999999999999999.99", "-0.01", "0", "1.500"} {
+		if _, err := Parse(in); err != nil {
+			t.Errorf("Parse(%q): %v", in, err)
+		}
+	}
+}
