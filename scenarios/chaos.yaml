@@ -1,0 +1,42 @@
+# Fault-heavy run: every failure mode is switched on.
+suppliers:
+  - name: air-a
+    product_lines: [FLIGHT]
+    order_latency_ms: [50, 300]
+    order_fail_rate: 0.05
+    callback_delay_ms: [500, 3000]
+    callback_fail_rate: 0.1
+    duplicate_rate: 0.3
+    out_of_order_rate: 0.1
+    no_callback_rate: 0.05
+  - name: rail-a
+    product_lines: [TRAIN]
+    order_latency_ms: [50, 300]
+    order_fail_rate: 0.05
+    callback_delay_ms: [500, 3000]
+    callback_fail_rate: 0.1
+    duplicate_rate: 0.3
+    out_of_order_rate: 0.1
+    no_callback_rate: 0.05
+  - name: hotel-a
+    product_lines: [HOTEL]
+    order_latency_ms: [50, 300]
+    order_fail_rate: 0.05
+    callback_delay_ms: [500, 3000]
+    callback_fail_rate: 0.1
+    duplicate_rate: 0.3
+    out_of_order_rate: 0.1
+    no_callback_rate: 0.05
+  - name: backup
+    product_lines: [FLIGHT, TRAIN, HOTEL]
+    order_latency_ms: [50, 300]
+    order_fail_rate: 0.05
+    callback_delay_ms: [500, 3000]
+    callback_fail_rate: 0.1
+    duplicate_rate: 0.3
+    out_of_order_rate: 0.1
+    no_callback_rate: 0.05
+customer_push: {fail_rate: 0.1, slow_success_rate: 0.05}
+finance_writeback: {fail_rate: 0.1, slow_success_rate: 0.05}
+verify: {amount_mismatch_rate: 0.02, title_mismatch_rate: 0.02, status_mismatch_rate: 0.01, missing_rate: 0.01}
+seed: 1

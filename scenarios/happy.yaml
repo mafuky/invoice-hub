@@ -1,0 +1,42 @@
+# Every fault rate is zero; delays stay short.
+suppliers:
+  - name: air-a
+    product_lines: [FLIGHT]
+    order_latency_ms: [10, 50]
+    order_fail_rate: 0
+    callback_delay_ms: [100, 500]
+    callback_fail_rate: 0
+    duplicate_rate: 0
+    out_of_order_rate: 0
+    no_callback_rate: 0
+  - name: rail-a
+    product_lines: [TRAIN]
+    order_latency_ms: [10, 50]
+    order_fail_rate: 0
+    callback_delay_ms: [100, 500]
+    callback_fail_rate: 0
+    duplicate_rate: 0
+    out_of_order_rate: 0
+    no_callback_rate: 0
+  - name: hotel-a
+    product_lines: [HOTEL]
+    order_latency_ms: [10, 50]
+    order_fail_rate: 0
+    callback_delay_ms: [100, 500]
+    callback_fail_rate: 0
+    duplicate_rate: 0
+    out_of_order_rate: 0
+    no_callback_rate: 0
+  - name: backup
+    product_lines: [FLIGHT, TRAIN, HOTEL]
+    order_latency_ms: [10, 50]
+    order_fail_rate: 0
+    callback_delay_ms: [100, 500]
+    callback_fail_rate: 0
+    duplicate_rate: 0
+    out_of_order_rate: 0
+    no_callback_rate: 0
+customer_push: {fail_rate: 0, slow_success_rate: 0}
+finance_writeback: {fail_rate: 0, slow_success_rate: 0}
+verify: {amount_mismatch_rate: 0, title_mismatch_rate: 0, status_mismatch_rate: 0, missing_rate: 0}
+seed: 1
