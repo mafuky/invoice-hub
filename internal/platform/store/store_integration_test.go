@@ -8,9 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
@@ -28,19 +30,23 @@ func loadCfg(t *testing.T) config.Config {
 
 func runID() string { return fmt.Sprintf("%08x", rand.Uint32()) }
 
+var migrationSets = func(cfg config.Config) []struct{ name, dsn string } {
+	return []struct{ name, dsn string }{
+		{"invoice", cfg.MySQLDSNInvoice},
+		{"provider", cfg.MySQLDSNProvider},
+		{"settlement", cfg.MySQLDSNSettlement},
+	}
+}
+
 // The app user may only touch invoice, provider and settlement, so the real
-// databases are used, and only when they are empty or already migrated.
+// databases are used. The down/up cycle runs only when every table is empty;
+// a database holding rows only gets a no-op Up.
 func TestMigrate_UpDownUp(t *testing.T) {
 	cfg := loadCfg(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	sets := []struct{ name, dsn string }{
-		{"invoice", cfg.MySQLDSNInvoice},
-		{"provider", cfg.MySQLDSNProvider},
-		{"settlement", cfg.MySQLDSNSettlement},
-	}
-	for _, s := range sets {
+	for _, s := range migrationSets(cfg) {
 		t.Run(s.name, func(t *testing.T) {
 			db, err := OpenMySQL(ctx, s.dsn)
 			if err != nil {
@@ -50,15 +56,41 @@ func TestMigrate_UpDownUp(t *testing.T) {
 
 			tables := listTables(t, ctx, db)
 			wasEmpty := len(tables) == 0
+			if !wasEmpty && !tables["schema_migrations"] {
+				t.Skipf("database %s holds tables not created by migrations; not touching it", s.name)
+			}
 			if !wasEmpty {
-				if !tables["schema_migrations"] {
-					t.Skipf("database %s holds tables not created by migrations; not touching it", s.name)
-				}
 				var dirty bool
 				if err := db.QueryRowContext(ctx, "SELECT dirty FROM schema_migrations LIMIT 1").Scan(&dirty); err != nil || dirty {
 					t.Skipf("database %s has an unusable schema_migrations state; not touching it", s.name)
 				}
 			}
+
+			if hasRows(t, ctx, db, tables) {
+				if err := MigrateMySQL(ctx, s.dsn, s.name); err != nil {
+					t.Fatalf("up on migrated database: %v", err)
+				}
+				t.Logf("%s: down/up skipped because the database has data", s.name)
+				return
+			}
+
+			// Leave the database as found: empty stays empty, migrated stays migrated.
+			t.Cleanup(func() {
+				cctx, c := context.WithTimeout(context.Background(), time.Minute)
+				defer c()
+				if wasEmpty {
+					if err := MigrateMySQLDown(cctx, s.dsn, s.name); err != nil {
+						t.Errorf("cleanup down: %v", err)
+					}
+					if _, err := db.ExecContext(cctx, "DROP TABLE IF EXISTS schema_migrations"); err != nil {
+						t.Errorf("cleanup drop schema_migrations: %v", err)
+					}
+					return
+				}
+				if err := MigrateMySQL(cctx, s.dsn, s.name); err != nil {
+					t.Errorf("cleanup up: %v", err)
+				}
+			})
 
 			must := func(err error, what string) {
 				t.Helper()
@@ -66,30 +98,41 @@ func TestMigrate_UpDownUp(t *testing.T) {
 					t.Fatalf("%s: %v", what, err)
 				}
 			}
-			must(MigrateMySQL(db, s.name), "up")
+			must(MigrateMySQL(ctx, s.dsn, s.name), "up")
 			got := listTables(t, ctx, db)
 			for _, want := range []string{"outbox", "processed_events"} {
 				if !got[want] {
 					t.Errorf("table %s missing after up", want)
 				}
 			}
-			must(MigrateMySQLDown(db, s.name), "down")
-			if after := listTables(t, ctx, db); after["outbox"] {
+			must(MigrateMySQLDown(ctx, s.dsn, s.name), "down")
+			if listTables(t, ctx, db)["outbox"] {
 				t.Error("outbox still present after down")
 			}
-			must(MigrateMySQL(db, s.name), "second up")
+			must(MigrateMySQL(ctx, s.dsn, s.name), "second up")
 			if !listTables(t, ctx, db)["outbox"] {
 				t.Error("outbox missing after second up")
 			}
-
-			if wasEmpty {
-				must(MigrateMySQLDown(db, s.name), "cleanup down")
-				if _, err := db.ExecContext(ctx, "DROP TABLE IF EXISTS schema_migrations"); err != nil {
-					t.Fatalf("cleanup: %v", err)
-				}
-			}
 		})
 	}
+}
+
+func hasRows(t *testing.T, ctx context.Context, db *sql.DB, tables map[string]bool) bool {
+	t.Helper()
+	for n := range tables {
+		if n == "schema_migrations" {
+			continue
+		}
+		var one int
+		err := db.QueryRowContext(ctx, "SELECT 1 FROM `"+n+"` LIMIT 1").Scan(&one)
+		if err == nil {
+			return true
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.Fatalf("probe %s: %v", n, err)
+		}
+	}
+	return false
 }
 
 func listTables(t *testing.T, ctx context.Context, db *sql.DB) map[string]bool {
@@ -108,6 +151,68 @@ func listTables(t *testing.T, ctx context.Context, db *sql.DB) map[string]bool {
 		out[n] = true
 	}
 	return out
+}
+
+// migratedInvoiceDB returns the invoice database with the schema applied,
+// skipping if it holds tables this repo did not create.
+func migratedInvoiceDB(t *testing.T) (context.Context, *sql.DB) {
+	t.Helper()
+	cfg := loadCfg(t)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	t.Cleanup(cancel)
+	db, err := OpenMySQL(ctx, cfg.MySQLDSNInvoice)
+	if err != nil {
+		t.Skipf("mysql unavailable: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	if tables := listTables(t, ctx, db); len(tables) > 0 && !tables["schema_migrations"] {
+		t.Skip("invoice database holds tables not created by migrations; not touching it")
+	}
+	if err := MigrateMySQL(ctx, cfg.MySQLDSNInvoice, "invoice"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	return ctx, db
+}
+
+// CURRENT_TIMESTAMP defaults follow the session zone, which OpenMySQL pins to UTC.
+func TestMySQL_DefaultTimestampIsUTC(t *testing.T) {
+	ctx, db := migratedInvoiceDB(t)
+	id := "tz-" + runID()
+	t.Cleanup(func() { db.ExecContext(context.Background(), "DELETE FROM outbox WHERE event_id = ?", id) })
+
+	if _, err := db.ExecContext(ctx, "INSERT INTO outbox (event_id, routing_key, body) VALUES (?, 'test.tz', '{}')", id); err != nil {
+		t.Fatal(err)
+	}
+	var created time.Time
+	if err := db.QueryRowContext(ctx, "SELECT created_at FROM outbox WHERE event_id = ?", id).Scan(&created); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(created); d > 5*time.Second || d < -5*time.Second {
+		t.Fatalf("created_at %v is %v away from now (%v)", created, d, time.Now().UTC())
+	}
+}
+
+func TestMySQL_BizOrderNoUniqueAndCaseSensitive(t *testing.T) {
+	ctx, db := migratedInvoiceDB(t)
+	no := "BIZ-" + runID()
+	t.Cleanup(func() {
+		db.ExecContext(context.Background(), "DELETE FROM invoices WHERE biz_order_no IN (?, ?)", no, strings.ToLower(no))
+	})
+	ins := func(n string) error {
+		_, err := db.ExecContext(ctx, `INSERT INTO invoices (biz_order_no, product_line, title, tax_no, amount, customer_id, status)
+			VALUES (?, 'saas', 'title', 'tax', 100.10, 'c1', 'PENDING')`, n)
+		return err
+	}
+	if err := ins(no); err != nil {
+		t.Fatal(err)
+	}
+	var me *mysql.MySQLError
+	if err := ins(no); !errors.As(err, &me) || me.Number != 1062 {
+		t.Fatalf("want error 1062, got %v", err)
+	}
+	if err := ins(strings.ToLower(no)); err != nil {
+		t.Fatalf("a different-case order number must be distinct: %v", err)
+	}
 }
 
 // The app user has readWrite on invoicehub only, so tests create their

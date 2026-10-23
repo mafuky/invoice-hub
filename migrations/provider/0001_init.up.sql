@@ -3,10 +3,10 @@ CREATE TABLE provider_orders (
   task_id            BIGINT      NOT NULL,
   invoice_id         BIGINT      NOT NULL,
   supplier           VARCHAR(32) NOT NULL,
-  supplier_order_no  VARCHAR(64) NOT NULL,
+  supplier_order_no  VARCHAR(64) COLLATE utf8mb4_bin NOT NULL,
   status             VARCHAR(24) NOT NULL,
   outcome            VARCHAR(24) NOT NULL DEFAULT '',
-  invoice_no         VARCHAR(64) NULL,
+  invoice_no         VARCHAR(64) COLLATE utf8mb4_bin NULL,
   version            INT         NOT NULL DEFAULT 0,
   created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -17,8 +17,8 @@ CREATE TABLE provider_orders (
 
 CREATE TABLE outbox (
   id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-  event_id        VARCHAR(36)  NOT NULL,
-  routing_key     VARCHAR(96)  NOT NULL,
+  event_id        VARCHAR(36) COLLATE utf8mb4_bin  NOT NULL,
+  routing_key     VARCHAR(96) COLLATE utf8mb4_bin  NOT NULL,
   body            JSON         NOT NULL,
   status          VARCHAR(8)   NOT NULL DEFAULT 'new',
   attempts        INT          NOT NULL DEFAULT 0,
@@ -29,7 +29,7 @@ CREATE TABLE outbox (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE processed_events (
-  event_id     VARCHAR(36) NOT NULL PRIMARY KEY,
+  event_id     VARCHAR(36) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
   consumer     VARCHAR(32) NOT NULL,
   processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

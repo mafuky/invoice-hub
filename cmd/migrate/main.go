@@ -14,8 +14,13 @@ import (
 )
 
 func main() {
-	down := flag.Bool("down", false, "revert MySQL migrations instead of applying them")
+	down := flag.Bool("down", false, "revert MySQL migrations instead of applying them (drops tables)")
+	yes := flag.Bool("yes", false, "confirm -down")
 	flag.Parse()
+	if *down && !*yes {
+		fmt.Fprintln(os.Stderr, "migrate: -down drops every table; pass -yes to confirm")
+		os.Exit(2)
+	}
 	if err := run(*down); err != nil {
 		fmt.Fprintln(os.Stderr, "migrate:", err)
 		os.Exit(1)
@@ -36,16 +41,12 @@ func run(down bool) error {
 		{"settlement", cfg.MySQLDSNSettlement},
 	}
 	for _, s := range sets {
-		db, err := store.OpenMySQL(ctx, s.dsn)
-		if err != nil {
-			return err
-		}
+		var err error
 		if down {
-			err = store.MigrateMySQLDown(db, s.name)
+			err = store.MigrateMySQLDown(ctx, s.dsn, s.name)
 		} else {
-			err = store.MigrateMySQL(db, s.name)
+			err = store.MigrateMySQL(ctx, s.dsn, s.name)
 		}
-		db.Close()
 		if err != nil {
 			return err
 		}

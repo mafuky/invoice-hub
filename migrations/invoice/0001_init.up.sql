@@ -1,13 +1,13 @@
 CREATE TABLE invoices (
   id            BIGINT AUTO_INCREMENT PRIMARY KEY,
-  biz_order_no  VARCHAR(64)   NOT NULL,
+  biz_order_no  VARCHAR(64) COLLATE utf8mb4_bin   NOT NULL,
   product_line  VARCHAR(16)   NOT NULL,
   title         VARCHAR(128)  NOT NULL,
   tax_no        VARCHAR(32)   NOT NULL,
   amount        DECIMAL(18,2) NOT NULL,
-  customer_id   VARCHAR(64)   NOT NULL,
+  customer_id   VARCHAR(64) COLLATE utf8mb4_bin   NOT NULL,
   status        VARCHAR(24)   NOT NULL,
-  invoice_no    VARCHAR(64)   NULL,
+  invoice_no    VARCHAR(64) COLLATE utf8mb4_bin   NULL,
   version       INT           NOT NULL DEFAULT 0,
   created_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at    DATETIME(3)   NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
@@ -36,7 +36,8 @@ CREATE TABLE tasks (
   deadline_at   DATETIME(3) NULL,
   version       INT         NOT NULL DEFAULT 0,
   INDEX idx_tasks_status_deadline (status, deadline_at),
-  INDEX idx_tasks_invoice (invoice_id)
+  INDEX idx_tasks_invoice (invoice_id),
+  INDEX idx_tasks_command (command_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE state_log (
@@ -46,15 +47,15 @@ CREATE TABLE state_log (
   from_status VARCHAR(24) NOT NULL,
   to_status   VARCHAR(24) NOT NULL,
   cause       VARCHAR(64) NOT NULL,
-  event_id    VARCHAR(36) NULL,
+  event_id    VARCHAR(36) COLLATE utf8mb4_bin NULL,
   at          DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   INDEX idx_state_log_entity (entity, entity_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE outbox (
   id              BIGINT AUTO_INCREMENT PRIMARY KEY,
-  event_id        VARCHAR(36)  NOT NULL,
-  routing_key     VARCHAR(96)  NOT NULL,
+  event_id        VARCHAR(36) COLLATE utf8mb4_bin  NOT NULL,
+  routing_key     VARCHAR(96) COLLATE utf8mb4_bin  NOT NULL,
   body            JSON         NOT NULL,
   status          VARCHAR(8)   NOT NULL DEFAULT 'new',
   attempts        INT          NOT NULL DEFAULT 0,
@@ -65,7 +66,7 @@ CREATE TABLE outbox (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE TABLE processed_events (
-  event_id     VARCHAR(36) NOT NULL PRIMARY KEY,
+  event_id     VARCHAR(36) COLLATE utf8mb4_bin NOT NULL PRIMARY KEY,
   consumer     VARCHAR(32) NOT NULL,
   processed_at DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
