@@ -1,0 +1,9 @@
+.env
+.env.*
+!.env.example
+study/
+docs/superpowers/
+CLAUDE.local.md
+runs/
+.DS_Store
+/bin/
