@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package invoicehub.settlement.v1;
+
+option go_package = "github.com/mafuky/invoice-hub/gen/invoicehub/settlement/v1;settlementv1";
+
+service SettlementService {
+  rpc Get(GetRequest) returns (Settlement);
+  rpc List(ListRequest) returns (ListReply);
+  rpc Calculate(IDRequest) returns (Settlement);
+  rpc SubmitReview(IDRequest) returns (Settlement);
+  rpc Approve(IDRequest) returns (Settlement);
+  rpc Reject(RejectRequest) returns (Settlement);
+  rpc Pay(IDRequest) returns (Settlement);
+}
+
+message GetRequest {
+  int64 settlement_id = 1;
+}
+
+message ListRequest {
+  string status = 1;
+}
+
+message ListReply {
+  repeated Settlement settlements = 1;
+}
+
+message IDRequest {
+  int64 settlement_id = 1;
+}
+
+message RejectRequest {
+  int64 settlement_id = 1;
+  string reason = 2;
+}
+
+message SettlementItem {
+  int64 invoice_id = 1;
+  // Decimal string, e.g. "100.10".
+  string amount = 2;
+  bool verified = 3;
+  repeated string checks = 4;
+}
+
+message Settlement {
+  int64 settlement_id = 1;
+  string period = 2;
+  string customer_id = 3;
+  string amount = 4;
+  string status = 5;
+  int64 version = 6;
+  repeated SettlementItem items = 7;
+}

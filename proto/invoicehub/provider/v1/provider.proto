@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+package invoicehub.provider.v1;
+
+option go_package = "github.com/mafuky/invoice-hub/gen/invoicehub/provider/v1;providerv1";
+
+enum CallbackOutcome {
+  CALLBACK_OUTCOME_UNSPECIFIED = 0;
+  CALLBACK_OUTCOME_SUCCEEDED = 1;
+  CALLBACK_OUTCOME_FAILED = 2;
+}
+
+enum CallbackResult {
+  CALLBACK_RESULT_UNSPECIFIED = 0;
+  CALLBACK_RESULT_ACCEPTED = 1;
+  CALLBACK_RESULT_DUPLICATE = 2;
+  CALLBACK_RESULT_UNKNOWN_ORDER = 3;
+}
+
+enum OrderOutcome {
+  ORDER_OUTCOME_UNSPECIFIED = 0;
+  ORDER_OUTCOME_PENDING = 1;
+  ORDER_OUTCOME_SUCCEEDED = 2;
+  ORDER_OUTCOME_FAILED = 3;
+}
+
+service ProviderService {
+  rpc HandleCallback(CallbackRequest) returns (CallbackReply);
+  rpc QueryOrder(QueryOrderRequest) returns (QueryOrderReply);
+}
+
+message CallbackRequest {
+  string supplier = 1;
+  string supplier_order_no = 2;
+  int64 event_seq = 3;
+  CallbackOutcome outcome = 4;
+  string invoice_no = 5;
+  // Original payload, stored as received.
+  string raw_json = 6;
+}
+
+message CallbackReply {
+  CallbackResult result = 1;
+}
+
+message QueryOrderRequest {
+  int64 task_id = 1;
+}
+
+message QueryOrderReply {
+  bool found = 1;
+  OrderOutcome outcome = 2;
+  string invoice_no = 3;
+}

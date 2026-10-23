@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package invoicehub.invoice.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/mafuky/invoice-hub/gen/invoicehub/invoice/v1;invoicev1";
+
+enum ProductLine {
+  PRODUCT_LINE_UNSPECIFIED = 0;
+  PRODUCT_LINE_FLIGHT = 1;
+  PRODUCT_LINE_TRAIN = 2;
+  PRODUCT_LINE_HOTEL = 3;
+}
+
+service InvoiceService {
+  rpc Apply(ApplyRequest) returns (ApplyReply);
+  rpc Get(GetRequest) returns (Invoice);
+  rpc List(ListRequest) returns (ListReply);
+  rpc RedFlush(RedFlushRequest) returns (CommandReply);
+  rpc Reissue(ReissueRequest) returns (CommandReply);
+  rpc Supplement(SupplementRequest) returns (CommandReply);
+}
+
+message ApplyRequest {
+  string biz_order_no = 1;
+  ProductLine product_line = 2;
+  string title = 3;
+  string tax_no = 4;
+  // Decimal string, e.g. "100.10".
+  string amount = 5;
+  string customer_id = 6;
+}
+
+message ApplyReply {
+  int64 invoice_id = 1;
+  // True when the biz_order_no already had an invoice.
+  bool existed = 2;
+}
+
+message GetRequest {
+  int64 invoice_id = 1;
+}
+
+message ListRequest {
+  string status = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListReply {
+  repeated Invoice invoices = 1;
+  string next_page_token = 2;
+}
+
+message RedFlushRequest {
+  int64 invoice_id = 1;
+  string reason = 2;
+}
+
+message ReissueRequest {
+  int64 invoice_id = 1;
+  string reason = 2;
+}
+
+message SupplementRequest {
+  string biz_order_no = 1;
+  ProductLine product_line = 2;
+  string title = 3;
+  string tax_no = 4;
+  string amount = 5;
+  string customer_id = 6;
+}
+
+message CommandReply {
+  int64 invoice_id = 1;
+  string status = 2;
+}
+
+message Invoice {
+  int64 invoice_id = 1;
+  string biz_order_no = 2;
+  ProductLine product_line = 3;
+  string title = 4;
+  string tax_no = 5;
+  string amount = 6;
+  string status = 7;
+  int64 version = 8;
+  google.protobuf.Timestamp created_at = 9;
+  google.protobuf.Timestamp updated_at = 10;
+}
