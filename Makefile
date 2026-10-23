@@ -1,4 +1,4 @@
-.PHONY: test lint proto install-proto-tools
+.PHONY: test lint proto install-proto-tools migrate
 
 # protoc plugins are installed with go install into GOPATH/bin.
 GOBIN_DIR := $(shell go env GOPATH)/bin
@@ -19,3 +19,7 @@ install-proto-tools:
 
 # Infrastructure targets (up, down, ps, tunnel, tunnel-stop, dev-check) live in infra.mk.
 -include infra.mk
+
+# Needs the tunnel (make tunnel) and a filled .env.
+migrate:
+	go run ./cmd/migrate
