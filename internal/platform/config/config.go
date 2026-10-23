@@ -1,0 +1,146 @@
+// Package config loads service settings from the environment and an optional .env file.
+package config
+
+import (
+	"bufio"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+type Config struct {
+	SSHHost   string
+	SSHPort   string
+	SSHUser   string
+	RemoteDir string
+
+	MySQLDSNInvoice    string
+	MySQLDSNProvider   string
+	MySQLDSNSettlement string
+
+	RedisAddr     string
+	RedisPassword string
+	AMQPURL       string
+	MongoURI      string
+	MongoDB       string
+
+	APIAddr        string
+	InvoiceAddr    string
+	ProviderAddr   string
+	SettlementAddr string
+	DeliveryAddr   string
+	MockAddr       string
+
+	MockURL         string
+	MockCallbackURL string
+}
+
+var keyRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
+
+// Load reads the process environment, falling back to a .env file in the
+// repository root (the nearest parent directory holding go.mod).
+func Load() (Config, error) {
+	file := map[string]string{}
+	if root, ok := repoRoot(); ok {
+		if m, err := parseEnvFile(filepath.Join(root, ".env")); err == nil {
+			file = m
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return Config{}, fmt.Errorf("config: read .env: %w", err)
+		}
+	}
+
+	var missing []string
+	get := func(key, def string, required bool) string {
+		v, ok := os.LookupEnv(key)
+		if !ok || v == "" {
+			v = file[key]
+		}
+		if v == "" {
+			if required {
+				missing = append(missing, key)
+			}
+			return def
+		}
+		return v
+	}
+
+	c := Config{
+		SSHHost:   get("INVHUB_SSH_HOST", "", false),
+		SSHPort:   get("INVHUB_SSH_PORT", "", false),
+		SSHUser:   get("INVHUB_SSH_USER", "", false),
+		RemoteDir: get("INVHUB_REMOTE_DIR", "", false),
+
+		MySQLDSNInvoice:    get("INVHUB_MYSQL_DSN_INVOICE", "", true),
+		MySQLDSNProvider:   get("INVHUB_MYSQL_DSN_PROVIDER", "", true),
+		MySQLDSNSettlement: get("INVHUB_MYSQL_DSN_SETTLEMENT", "", true),
+
+		RedisAddr:     get("INVHUB_REDIS_ADDR", "", true),
+		RedisPassword: get("INVHUB_REDIS_PASSWORD", "", false),
+		AMQPURL:       get("INVHUB_AMQP_URL", "", true),
+		MongoURI:      get("INVHUB_MONGO_URI", "", true),
+		MongoDB:       get("INVHUB_MONGO_DB", "", true),
+
+		APIAddr:        get("INVHUB_API_ADDR", ":8080", false),
+		InvoiceAddr:    get("INVHUB_INVOICE_ADDR", ":9101", false),
+		ProviderAddr:   get("INVHUB_PROVIDER_ADDR", ":9102", false),
+		SettlementAddr: get("INVHUB_SETTLEMENT_ADDR", ":9103", false),
+		DeliveryAddr:   get("INVHUB_DELIVERY_ADDR", ":9104", false),
+		MockAddr:       get("INVHUB_MOCK_ADDR", ":8090", false),
+
+		MockURL:         get("INVHUB_MOCK_URL", "http://127.0.0.1:8090", false),
+		MockCallbackURL: get("INVHUB_MOCK_CALLBACK_URL", "http://127.0.0.1:8080/callbacks", false),
+	}
+	if len(missing) > 0 {
+		return Config{}, fmt.Errorf("config: missing required keys: %s", strings.Join(missing, ", "))
+	}
+	return c, nil
+}
+
+func repoRoot() (string, bool) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", false
+		}
+		dir = parent
+	}
+}
+
+// parseEnvFile reads KEY=VALUE lines only; nothing is evaluated or expanded.
+func parseEnvFile(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	out := map[string]string{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		k = strings.TrimSpace(k)
+		if !ok || !keyRe.MatchString(k) {
+			continue
+		}
+		v = strings.TrimSpace(v)
+		if len(v) >= 2 && (v[0] == '"' || v[0] == '\'') && v[len(v)-1] == v[0] {
+			v = v[1 : len(v)-1]
+		}
+		out[k] = v
+	}
+	return out, sc.Err()
+}
