@@ -8,3 +8,6 @@ lint:
 
 proto:
 	buf generate
+
+# Infrastructure targets (up, down, ps, tunnel, tunnel-stop, dev-check) live in infra.mk.
+-include infra.mk
