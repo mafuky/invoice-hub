@@ -319,14 +319,16 @@ func (x *SettlementItem) GetChecks() []string {
 }
 
 type Settlement struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	SettlementId  int64                  `protobuf:"varint,1,opt,name=settlement_id,json=settlementId,proto3" json:"settlement_id,omitempty"`
-	Period        string                 `protobuf:"bytes,2,opt,name=period,proto3" json:"period,omitempty"`
-	CustomerId    string                 `protobuf:"bytes,3,opt,name=customer_id,json=customerId,proto3" json:"customer_id,omitempty"`
-	Amount        string                 `protobuf:"bytes,4,opt,name=amount,proto3" json:"amount,omitempty"`
-	Status        string                 `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
-	Version       int64                  `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
-	Items         []*SettlementItem      `protobuf:"bytes,7,rep,name=items,proto3" json:"items,omitempty"`
+	state        protoimpl.MessageState `protogen:"open.v1"`
+	SettlementId int64                  `protobuf:"varint,1,opt,name=settlement_id,json=settlementId,proto3" json:"settlement_id,omitempty"`
+	Period       string                 `protobuf:"bytes,2,opt,name=period,proto3" json:"period,omitempty"`
+	CustomerId   string                 `protobuf:"bytes,3,opt,name=customer_id,json=customerId,proto3" json:"customer_id,omitempty"`
+	Amount       string                 `protobuf:"bytes,4,opt,name=amount,proto3" json:"amount,omitempty"`
+	// One of: created, pending_settle, calculated, pending_review, rejected,
+	// pending_payment, paid.
+	Status        string            `protobuf:"bytes,5,opt,name=status,proto3" json:"status,omitempty"`
+	Version       int64             `protobuf:"varint,6,opt,name=version,proto3" json:"version,omitempty"`
+	Items         []*SettlementItem `protobuf:"bytes,7,rep,name=items,proto3" json:"items,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }

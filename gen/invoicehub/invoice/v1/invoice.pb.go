@@ -256,6 +256,7 @@ func (x *GetRequest) GetInvoiceId() int64 {
 	return 0
 }
 
+// page_size defaults to 50 and is capped at 200; page_token is opaque.
 type ListRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Status        string                 `protobuf:"bytes,1,opt,name=status,proto3" json:"status,omitempty"`
@@ -557,9 +558,13 @@ func (x *SupplementRequest) GetCustomerId() string {
 }
 
 type CommandReply struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	InvoiceId     int64                  `protobuf:"varint,1,opt,name=invoice_id,json=invoiceId,proto3" json:"invoice_id,omitempty"`
-	Status        string                 `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The invoice the command acts on: the original invoice for RedFlush and
+	// Reissue, the newly created invoice for Supplement.
+	InvoiceId int64 `protobuf:"varint,1,opt,name=invoice_id,json=invoiceId,proto3" json:"invoice_id,omitempty"`
+	// Command status: created, dispatched, succeeded or failed.
+	Status        string `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	CommandId     int64  `protobuf:"varint,3,opt,name=command_id,json=commandId,proto3" json:"command_id,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -608,14 +613,23 @@ func (x *CommandReply) GetStatus() string {
 	return ""
 }
 
+func (x *CommandReply) GetCommandId() int64 {
+	if x != nil {
+		return x.CommandId
+	}
+	return 0
+}
+
 type Invoice struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	InvoiceId     int64                  `protobuf:"varint,1,opt,name=invoice_id,json=invoiceId,proto3" json:"invoice_id,omitempty"`
-	BizOrderNo    string                 `protobuf:"bytes,2,opt,name=biz_order_no,json=bizOrderNo,proto3" json:"biz_order_no,omitempty"`
-	ProductLine   ProductLine            `protobuf:"varint,3,opt,name=product_line,json=productLine,proto3,enum=invoicehub.invoice.v1.ProductLine" json:"product_line,omitempty"`
-	Title         string                 `protobuf:"bytes,4,opt,name=title,proto3" json:"title,omitempty"`
-	TaxNo         string                 `protobuf:"bytes,5,opt,name=tax_no,json=taxNo,proto3" json:"tax_no,omitempty"`
-	Amount        string                 `protobuf:"bytes,6,opt,name=amount,proto3" json:"amount,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	InvoiceId   int64                  `protobuf:"varint,1,opt,name=invoice_id,json=invoiceId,proto3" json:"invoice_id,omitempty"`
+	BizOrderNo  string                 `protobuf:"bytes,2,opt,name=biz_order_no,json=bizOrderNo,proto3" json:"biz_order_no,omitempty"`
+	ProductLine ProductLine            `protobuf:"varint,3,opt,name=product_line,json=productLine,proto3,enum=invoicehub.invoice.v1.ProductLine" json:"product_line,omitempty"`
+	Title       string                 `protobuf:"bytes,4,opt,name=title,proto3" json:"title,omitempty"`
+	TaxNo       string                 `protobuf:"bytes,5,opt,name=tax_no,json=taxNo,proto3" json:"tax_no,omitempty"`
+	Amount      string                 `protobuf:"bytes,6,opt,name=amount,proto3" json:"amount,omitempty"`
+	// One of: applying, issuing, issued, delivered, closed, red_flushing,
+	// red_flushed, failed.
 	Status        string                 `protobuf:"bytes,7,opt,name=status,proto3" json:"status,omitempty"`
 	Version       int64                  `protobuf:"varint,8,opt,name=version,proto3" json:"version,omitempty"`
 	CreatedAt     *timestamppb.Timestamp `protobuf:"bytes,9,opt,name=created_at,json=createdAt,proto3" json:"created_at,omitempty"`
@@ -771,11 +785,13 @@ const file_invoicehub_invoice_v1_invoice_proto_rawDesc = "" +
 	"\x06tax_no\x18\x04 \x01(\tR\x05taxNo\x12\x16\n" +
 	"\x06amount\x18\x05 \x01(\tR\x06amount\x12\x1f\n" +
 	"\vcustomer_id\x18\x06 \x01(\tR\n" +
-	"customerId\"E\n" +
+	"customerId\"d\n" +
 	"\fCommandReply\x12\x1d\n" +
 	"\n" +
 	"invoice_id\x18\x01 \x01(\x03R\tinvoiceId\x12\x16\n" +
-	"\x06status\x18\x02 \x01(\tR\x06status\"\xfe\x02\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1d\n" +
+	"\n" +
+	"command_id\x18\x03 \x01(\x03R\tcommandId\"\xfe\x02\n" +
 	"\aInvoice\x12\x1d\n" +
 	"\n" +
 	"invoice_id\x18\x01 \x01(\x03R\tinvoiceId\x12 \n" +

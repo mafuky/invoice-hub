@@ -48,6 +48,8 @@ message Settlement {
   string period = 2;
   string customer_id = 3;
   string amount = 4;
+  // One of: created, pending_settle, calculated, pending_review, rejected,
+  // pending_payment, paid.
   string status = 5;
   int64 version = 6;
   repeated SettlementItem items = 7;
