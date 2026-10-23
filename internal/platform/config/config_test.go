@@ -176,3 +176,21 @@ func TestConfig_MissingListsAllKeys(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadMock_NoMiddlewareKeysNeeded(t *testing.T) {
+	isolate(t)
+	c, err := LoadMock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Addr != ":8090" || c.CallbackURL != "http://127.0.0.1:8080/callbacks" {
+		t.Fatalf("defaults: %+v", c)
+	}
+	if _, err := Load(); err == nil {
+		t.Fatal("Load must still require middleware keys")
+	}
+	t.Setenv("INVHUB_MOCK_ADDR", ":9999")
+	if c, _ := LoadMock(); c.Addr != ":9999" {
+		t.Fatalf("override: %+v", c)
+	}
+}

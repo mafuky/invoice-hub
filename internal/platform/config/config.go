@@ -41,33 +41,75 @@ type Config struct {
 
 var keyRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
 
-// Load reads the process environment, falling back to a .env file in the
-// repository root (the nearest parent directory holding go.mod).
-// An empty environment variable counts as unset.
-func Load() (Config, error) {
+const (
+	defaultMockAddr        = ":8090"
+	defaultMockCallbackURL = "http://127.0.0.1:8080/callbacks"
+)
+
+// source resolves keys from the process environment, then the .env file.
+type source struct {
+	file    map[string]string
+	missing []string
+}
+
+func newSource() (*source, error) {
 	file := map[string]string{}
 	if root, ok := repoRoot(); ok {
 		if m, err := parseEnvFile(filepath.Join(root, ".env")); err == nil {
 			file = m
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return Config{}, fmt.Errorf("config: read .env: %w", err)
+			return nil, fmt.Errorf("config: read .env: %w", err)
 		}
 	}
+	return &source{file: file}, nil
+}
 
-	var missing []string
-	get := func(key, def string, required bool) string {
-		v, ok := os.LookupEnv(key)
-		if !ok || v == "" {
-			v = file[key]
-		}
-		if v == "" {
-			if required {
-				missing = append(missing, key)
-			}
-			return def
-		}
-		return v
+func (s *source) get(key, def string, required bool) string {
+	v, ok := os.LookupEnv(key)
+	if !ok || v == "" {
+		v = s.file[key]
 	}
+	if v == "" {
+		if required {
+			s.missing = append(s.missing, key)
+		}
+		return def
+	}
+	return v
+}
+
+// MockConfig is the subset of settings the mock-supplier needs.
+type MockConfig struct {
+	Addr        string
+	CallbackURL string
+}
+
+// LoadMock reads only the mock-supplier keys, so it runs without middleware settings.
+func LoadMock() (MockConfig, error) {
+	src, err := newSource()
+	if err != nil {
+		return MockConfig{}, err
+	}
+	return src.mock(), nil
+}
+
+func (s *source) mock() MockConfig {
+	return MockConfig{
+		Addr:        s.get("INVHUB_MOCK_ADDR", defaultMockAddr, false),
+		CallbackURL: s.get("INVHUB_MOCK_CALLBACK_URL", defaultMockCallbackURL, false),
+	}
+}
+
+// Load reads the process environment, falling back to a .env file in the
+// repository root (the nearest parent directory holding go.mod).
+// An empty environment variable counts as unset.
+func Load() (Config, error) {
+	src, err := newSource()
+	if err != nil {
+		return Config{}, err
+	}
+	get := src.get
+	mc := src.mock()
 
 	c := Config{
 		SSHHost:   get("INVHUB_SSH_HOST", "", false),
@@ -90,13 +132,13 @@ func Load() (Config, error) {
 		ProviderAddr:   get("INVHUB_PROVIDER_ADDR", ":9102", false),
 		SettlementAddr: get("INVHUB_SETTLEMENT_ADDR", ":9103", false),
 		DeliveryAddr:   get("INVHUB_DELIVERY_ADDR", ":9104", false),
-		MockAddr:       get("INVHUB_MOCK_ADDR", ":8090", false),
+		MockAddr:       mc.Addr,
 
 		MockURL:         get("INVHUB_MOCK_URL", "http://127.0.0.1:8090", false),
-		MockCallbackURL: get("INVHUB_MOCK_CALLBACK_URL", "http://127.0.0.1:8080/callbacks", false),
+		MockCallbackURL: mc.CallbackURL,
 	}
-	if len(missing) > 0 {
-		return Config{}, fmt.Errorf("config: missing required keys: %s", strings.Join(missing, ", "))
+	if len(src.missing) > 0 {
+		return Config{}, fmt.Errorf("config: missing required keys: %s", strings.Join(src.missing, ", "))
 	}
 	return c, nil
 }

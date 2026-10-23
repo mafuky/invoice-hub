@@ -57,7 +57,8 @@ type order struct {
 
 type supplier struct {
 	cfg    SupplierCfg
-	rng    *rng
+	seed   uint64
+	hash   uint64
 	ctx    context.Context
 	wg     *sync.WaitGroup
 	cbBase string
@@ -82,7 +83,7 @@ func newSupplier(ctx context.Context, wg *sync.WaitGroup, cfg SupplierCfg, seed 
 		h = (h ^ uint64(c)) * 1099511628211
 	}
 	return &supplier{
-		cfg: cfg, rng: newRNG(seed, h), ctx: ctx, wg: wg,
+		cfg: cfg, seed: seed, hash: h, ctx: ctx, wg: wg,
 		cbBase: strings.TrimRight(cbBase, "/"), client: &http.Client{Timeout: 5 * time.Second},
 		verify: v, log: log, lines: lines,
 		orders: map[string]*order{}, byTask: map[string]string{},
@@ -121,15 +122,6 @@ func (s *supplier) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if !s.sleep(s.rng.between(s.cfg.OrderLatencyMS)) {
-		writeErr(w, http.StatusServiceUnavailable, "shutting down")
-		return
-	}
-	if s.rng.hit(s.cfg.OrderFailRate) {
-		writeErr(w, http.StatusServiceUnavailable, "injected failure")
-		return
-	}
-
 	s.mu.Lock()
 	// A repeated task id gets the original order back instead of a second one.
 	if req.TaskID != "" {
@@ -140,14 +132,29 @@ func (s *supplier) createOrder(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.seq++
-	o := &order{no: fmt.Sprintf("%s-ORD-%06d", strings.ToUpper(s.cfg.Name), s.seq), req: req, outcome: outcomePending}
+	seq := s.seq
+	o := &order{no: fmt.Sprintf("%s-ORD-%06d", strings.ToUpper(s.cfg.Name), seq), req: req, outcome: outcomePending}
 	s.orders[o.no] = o
 	if req.TaskID != "" {
 		s.byTask[req.TaskID] = o.no
 	}
 	s.mu.Unlock()
 
-	steps := s.plan(o)
+	// Every random draw for this order comes from its own stream, so results
+	// do not depend on how concurrent requests interleave.
+	g := newRNG(s.seed, s.hash^uint64(seq)*0x9e3779b97f4a7c15)
+	if !s.sleep(g.between(s.cfg.OrderLatencyMS)) {
+		s.forget(o)
+		writeErr(w, http.StatusServiceUnavailable, "shutting down")
+		return
+	}
+	if g.hit(s.cfg.OrderFailRate) {
+		s.forget(o)
+		writeErr(w, http.StatusServiceUnavailable, "injected failure")
+		return
+	}
+
+	steps := s.plan(o, g)
 	if steps == nil {
 		s.mu.Lock()
 		o.hidden = true
@@ -161,16 +168,16 @@ func (s *supplier) createOrder(w http.ResponseWriter, r *http.Request) {
 
 // plan draws every random decision for an order up front. A nil result
 // means the supplier will never call back.
-func (s *supplier) plan(o *order) []step {
-	if s.rng.hit(s.cfg.NoCallbackRate) {
+func (s *supplier) plan(o *order, r *rng) []step {
+	if r.hit(s.cfg.NoCallbackRate) {
 		return nil
 	}
-	first := s.rng.between(s.cfg.CallbackDelayMS)
-	failed := s.rng.hit(s.cfg.CallbackFailRate)
-	ooo := !failed && s.rng.hit(s.cfg.OutOfOrderRate)
+	first := r.between(s.cfg.CallbackDelayMS)
+	failed := r.hit(s.cfg.CallbackFailRate)
+	ooo := !failed && r.hit(s.cfg.OutOfOrderRate)
 	dups := 0
-	if s.rng.hit(s.cfg.DuplicateRate) {
-		dups = 1 + s.rng.intn(3)
+	if r.hit(s.cfg.DuplicateRate) {
+		dups = 1 + r.intn(3)
 	}
 
 	mk := func(seq int, outcome, inv string) callbackBody {
@@ -182,23 +189,33 @@ func (s *supplier) plan(o *order) []step {
 	case failed:
 		steps = []step{{first, mk(1, outcomeFailed, "")}}
 	case ooo:
-		inv := s.newInvoiceNo()
+		inv := newInvoiceNo(s.cfg.Name, r)
 		steps = []step{
 			{first, mk(1, outcomeFailed, "")},
-			{s.rng.between(s.cfg.CallbackDelayMS), mk(2, outcomeSucceeded, inv)},
+			{r.between(s.cfg.CallbackDelayMS), mk(2, outcomeSucceeded, inv)},
 		}
 	default:
-		steps = []step{{first, mk(1, outcomeSucceeded, s.newInvoiceNo())}}
+		steps = []step{{first, mk(1, outcomeSucceeded, newInvoiceNo(s.cfg.Name, r))}}
 	}
 	last := steps[len(steps)-1]
 	for range dups {
-		steps = append(steps, step{s.rng.between(s.cfg.CallbackDelayMS), last.body})
+		steps = append(steps, step{r.between(s.cfg.CallbackDelayMS), last.body})
 	}
 	return steps
 }
 
-func (s *supplier) newInvoiceNo() string {
-	return fmt.Sprintf("%s-%08d", strings.ToUpper(s.cfg.Name), s.rng.intn(100_000_000))
+func newInvoiceNo(name string, r *rng) string {
+	return fmt.Sprintf("%s-%08d", strings.ToUpper(name), r.intn(100_000_000))
+}
+
+// forget drops an order that was never accepted.
+func (s *supplier) forget(o *order) {
+	s.mu.Lock()
+	delete(s.orders, o.no)
+	if o.req.TaskID != "" {
+		delete(s.byTask, o.req.TaskID)
+	}
+	s.mu.Unlock()
 }
 
 func (s *supplier) deliver(o *order, steps []step) {

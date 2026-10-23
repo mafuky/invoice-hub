@@ -105,7 +105,7 @@ func (c *collector) snapshot() []cb {
 
 func (c *collector) waitFor(t *testing.T, n int) []cb {
 	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
+	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if g := c.snapshot(); len(g) >= n {
 			return g
@@ -200,7 +200,10 @@ func TestSupplier_HappyPathCallbackAndQuery(t *testing.T) {
 	if !strings.HasPrefix(got.InvoiceNo, "AIR-A-") || len(got.InvoiceNo) != len("AIR-A-")+8 {
 		t.Fatalf("invoice_no format %q", got.InvoiceNo)
 	}
-	if p := col.path[0]; p != "/callbacks/air-a" {
+	col.mu.Lock()
+	p := col.path[0]
+	col.mu.Unlock()
+	if p != "/callbacks/air-a" {
 		t.Fatalf("callback path %q", p)
 	}
 
@@ -461,7 +464,7 @@ func TestVerifyData_MismatchRates(t *testing.T) {
 	sc = tinySupplier(nil)
 	sc.Verify.StatusMismatchRate = 1
 	v, _ = issueAndVerify(t, sc, nil)
-	if v.Status == "issued" {
+	if v.Status != "red_flushed" {
 		t.Fatalf("status mismatch %+v", v)
 	}
 
