@@ -5,6 +5,7 @@ package callback
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"sync"
@@ -64,6 +65,49 @@ func countRows(t *testing.T, db *sql.DB, q string, args ...any) int {
 	return n
 }
 
+// handleRetrying delivers cb the way a supplier does: a busy order is sent again.
+func handleRetrying(ctx context.Context, h *Handler, cb Callback) (Result, error) {
+	var (
+		res Result
+		err error
+	)
+	for attempt := 0; attempt < 50; attempt++ {
+		res, err = h.Handle(ctx, cb)
+		if !errors.Is(err, ErrBusy) {
+			return res, err
+		}
+		time.Sleep(time.Duration(5+rand.IntN(20)) * time.Millisecond)
+	}
+	return res, err
+}
+
+func outboxKeys(t *testing.T, db *sql.DB) []string {
+	t.Helper()
+	rows, err := db.Query(`SELECT routing_key FROM outbox ORDER BY id`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var keys []string
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			t.Fatal(err)
+		}
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func reload(t *testing.T, db *sql.DB, o store.Order) store.Order {
+	t.Helper()
+	got, err := store.NewRepo(db).GetBySupplierOrder(context.Background(), db, o.Supplier, o.SupplierOrderNo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
 func TestHandle_ConcurrentDuplicateCallbacks_OneOutboxEvent(t *testing.T) {
 	ctx := context.Background()
 	db := testenv.OpenMySQL(t, "provider")
@@ -75,6 +119,7 @@ func TestHandle_ConcurrentDuplicateCallbacks_OneOutboxEvent(t *testing.T) {
 		wg       sync.WaitGroup
 		mu       sync.Mutex
 		accepted int
+		dups     int
 	)
 	start := make(chan struct{})
 	for i := 0; i < workers; i++ {
@@ -82,42 +127,41 @@ func TestHandle_ConcurrentDuplicateCallbacks_OneOutboxEvent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			res, err := h.Handle(ctx, Callback{
+			res, err := handleRetrying(ctx, h, Callback{
 				Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 1,
 				Outcome: OutcomeSucceeded, InvoiceNo: "AIR-A-12345678",
-				// Only one of the concurrent payload stores can add a new document.
-				RawInserted: i == 0,
+				RawInserted: rand.IntN(2) == 0, // informational only
 			})
 			if err != nil {
-				t.Logf("worker %d: %v", i, err)
+				t.Errorf("worker %d: %v", i, err)
 				return
 			}
-			if res == Accepted {
-				mu.Lock()
+			mu.Lock()
+			defer mu.Unlock()
+			switch res {
+			case Accepted:
 				accepted++
-				mu.Unlock()
+			case Duplicate:
+				dups++
 			}
 		}()
 	}
 	close(start)
 	wg.Wait()
 
-	if accepted != 1 {
-		t.Fatalf("%d callbacks accepted, want 1", accepted)
+	if accepted != 1 || dups != workers-1 {
+		t.Fatalf("accepted %d, duplicate %d, want 1 and %d", accepted, dups, workers-1)
 	}
-	if n := countRows(t, db, `SELECT COUNT(*) FROM outbox WHERE routing_key = ?`, mq.ProviderTaskSucceeded); n != 1 {
-		t.Fatalf("succeeded events in outbox = %d, want 1", n)
+	if keys := outboxKeys(t, db); len(keys) != 1 || keys[0] != mq.ProviderTaskSucceeded {
+		t.Fatalf("outbox = %v, want one %s", keys, mq.ProviderTaskSucceeded)
 	}
-	got, err := store.NewRepo(db).GetBySupplierOrder(ctx, db, order.Supplier, order.SupplierOrderNo)
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := reload(t, db, order)
 	if got.Status != store.StatusSucceeded || got.Version != order.Version+1 {
 		t.Fatalf("order is %s at version %d, want succeeded at version %d", got.Status, got.Version, order.Version+1)
 	}
 }
 
-func TestHandle_LateFailedAfterSucceeded_Ignored(t *testing.T) {
+func TestHandle_SucceededThenOlderFailed_Ignored(t *testing.T) {
 	ctx := context.Background()
 	db := testenv.OpenMySQL(t, "provider")
 	h := NewHandler(db, store.NewRepo(db), lock.New(openRedis(t)))
@@ -138,15 +182,84 @@ func TestHandle_LateFailedAfterSucceeded_Ignored(t *testing.T) {
 		t.Fatalf("late seq 1 failed: %v %v, want Duplicate", res, err)
 	}
 
-	got, err := store.NewRepo(db).GetBySupplierOrder(ctx, db, order.Supplier, order.SupplierOrderNo)
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := reload(t, db, order)
 	if got.Status != store.StatusSucceeded || got.InvoiceNo != "AIR-A-87654321" {
 		t.Fatalf("order is %s with invoice_no %q, want succeeded with AIR-A-87654321", got.Status, got.InvoiceNo)
 	}
-	if n := countRows(t, db, `SELECT COUNT(*) FROM outbox WHERE routing_key = ?`, mq.ProviderTaskFailed); n != 0 {
-		t.Fatalf("failed events in outbox = %d, want 0", n)
+	if keys := outboxKeys(t, db); len(keys) != 1 || keys[0] != mq.ProviderTaskSucceeded {
+		t.Fatalf("outbox = %v, want only %s", keys, mq.ProviderTaskSucceeded)
+	}
+}
+
+func TestHandle_FailedThenNewerSucceeded_TwoEventsFinalSucceeded(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "provider")
+	h := NewHandler(db, store.NewRepo(db), lock.New(openRedis(t)))
+	order := submittedOrder(t, db)
+
+	res, err := h.Handle(ctx, Callback{
+		Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 1,
+		Outcome: OutcomeFailed, RawInserted: true,
+	})
+	if err != nil || res != Accepted {
+		t.Fatalf("seq 1 failed: %v %v, want Accepted", res, err)
+	}
+	res, err = h.Handle(ctx, Callback{
+		Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 2,
+		Outcome: OutcomeSucceeded, InvoiceNo: "AIR-A-24681357", RawInserted: true,
+	})
+	if err != nil || res != Accepted {
+		t.Fatalf("seq 2 succeeded: %v %v, want Accepted", res, err)
+	}
+
+	got := reload(t, db, order)
+	if got.Status != store.StatusSucceeded || got.InvoiceNo != "AIR-A-24681357" {
+		t.Fatalf("order is %s with invoice_no %q, want succeeded with AIR-A-24681357", got.Status, got.InvoiceNo)
+	}
+	keys := outboxKeys(t, db)
+	if len(keys) != 2 || keys[0] != mq.ProviderTaskFailed || keys[1] != mq.ProviderTaskSucceeded {
+		t.Fatalf("outbox = %v, want failed then succeeded", keys)
+	}
+}
+
+func TestHandle_TwoSeqsConcurrently_BothAppliedInOrder(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "provider")
+	h := NewHandler(db, store.NewRepo(db), lock.New(openRedis(t)))
+	order := submittedOrder(t, db)
+
+	cbs := []Callback{
+		{Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 1, Outcome: OutcomeFailed, RawInserted: true},
+		{Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 2, Outcome: OutcomeSucceeded, InvoiceNo: "AIR-A-13572468", RawInserted: true},
+	}
+	var wg sync.WaitGroup
+	for _, cb := range cbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := handleRetrying(ctx, h, cb); err != nil {
+				t.Errorf("seq %d: %v", cb.EventSeq, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got := reload(t, db, order)
+	if got.Status != store.StatusSucceeded || got.LastEventSeq != 2 {
+		t.Fatalf("order is %s at seq %d, want succeeded at seq 2", got.Status, got.LastEventSeq)
+	}
+	keys := outboxKeys(t, db)
+	// Failed may be skipped when seq 2 wins the race, but must never follow succeeded.
+	seenSucceeded := false
+	for _, k := range keys {
+		if k == mq.ProviderTaskSucceeded {
+			seenSucceeded = true
+		} else if seenSucceeded {
+			t.Fatalf("outbox = %v: an event with a regressed seq follows succeeded", keys)
+		}
+	}
+	if !seenSucceeded || len(keys) > 2 {
+		t.Fatalf("outbox = %v, want succeeded, optionally preceded by failed", keys)
 	}
 }
 

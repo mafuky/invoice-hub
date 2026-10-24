@@ -232,3 +232,27 @@ func TestQueryOrder_SupplierDown_Unavailable(t *testing.T) {
 		t.Fatalf("code = %v, want Unavailable", got)
 	}
 }
+
+func TestHandleCallback_HandlerBusy_Unavailable(t *testing.T) {
+	h := &fakeHandler{err: fmt.Errorf("order AIR-A-ORD-000999: %w", callback.ErrBusy)}
+	c := start(t, h, &fakeSink{}, fakeOrders{}, nil)
+	_, err := c.HandleCallback(context.Background(), callbackRequest())
+	if got := status.Code(err); got != codes.Unavailable {
+		t.Fatalf("code = %v, want Unavailable so the supplier retries", got)
+	}
+}
+
+func TestHandleCallback_NonPositiveEventSeq_InvalidArgumentAndNothingStored(t *testing.T) {
+	sink := &fakeSink{}
+	h := &fakeHandler{result: callback.Accepted}
+	c := start(t, h, sink, fakeOrders{}, nil)
+	req := callbackRequest()
+	req.EventSeq = 0
+	_, err := c.HandleCallback(context.Background(), req)
+	if got := status.Code(err); got != codes.InvalidArgument {
+		t.Fatalf("code = %v, want InvalidArgument", got)
+	}
+	if len(sink.stored) != 0 || len(h.got) != 0 {
+		t.Fatalf("stored %d payloads and called the handler %d times, want 0 and 0", len(sink.stored), len(h.got))
+	}
+}

@@ -99,3 +99,23 @@ func TestOnTaskCreated_ReplacementTaskAvoidsFailedSupplier(t *testing.T) {
 		t.Fatalf("replacement task went to %q (err %v), want backup", supplier, err)
 	}
 }
+
+func TestOnTaskCreated_OlderSubmittedOrderIsExcluded(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "provider")
+	repo := store.NewRepo(db)
+	mock, _ := countingMock(t)
+	a := NewProviderAgent(db, repo, mock, DefaultSuppliers())
+
+	// Task 701 was ordered at air-a and never answered; task 702 replaced it.
+	if _, err := repo.InsertOrder(ctx, db, store.NewOrder{TaskID: 701, InvoiceID: 411, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-900002"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.OnTaskCreated(ctx, taskCreatedEnvelope(t, 702, 411, "FLIGHT")); err != nil {
+		t.Fatal(err)
+	}
+	var supplier string
+	if err := db.QueryRow(`SELECT supplier FROM provider_orders WHERE task_id = 702`).Scan(&supplier); err != nil || supplier != "backup" {
+		t.Fatalf("replacement task went to %q (err %v), want backup", supplier, err)
+	}
+}

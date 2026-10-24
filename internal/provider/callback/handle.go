@@ -42,9 +42,16 @@ func (r Result) String() string {
 	return fmt.Sprintf("result(%d)", int(r))
 }
 
+// ErrBusy means another callback for the same order is being processed. The
+// callback was not applied and the supplier should send it again; it is never
+// a duplicate.
+var ErrBusy = errors.New("supplier order is being processed")
+
 // Callback is one supplier notification. The raw payload is already stored
-// when it reaches Handle; RawInserted tells whether that store added a new
-// payload (true) or found the same event_seq of the order already there (false).
+// when it reaches Handle. RawInserted tells whether that store added a new
+// payload (true) or found the same event_seq of the order already there
+// (false); it is for logs only, and whether the callback takes effect is
+// decided by the order in MySQL, never by this flag.
 type Callback struct {
 	Supplier        string
 	SupplierOrderNo string
@@ -73,20 +80,26 @@ func NewHandler(db *sql.DB, repo *store.Repo, locks Locker) *Handler {
 }
 
 // Handle applies one supplier callback to the provider order it names and, when
-// the callback changes the order, announces the outcome with a
-// provider.task.succeeded or provider.task.failed event. It returns Accepted
-// for a callback that changed the order, Duplicate for one that changed
-// nothing, and UnknownOrder when the supplier order does not exist here.
+// the callback changes the order, writes a provider.task.succeeded or
+// provider.task.failed event in the same transaction. It returns Accepted for
+// a callback that changed the order, Duplicate for one that changed nothing,
+// UnknownOrder when the supplier order does not exist here, and ErrBusy when
+// another callback for the order is in flight.
 //
-// Invariant: however often and in whatever order the supplier calls, an order
-// reaches its final status once, one outcome event is written for it, and an
-// order that is already final is never rewritten by an older or repeated
-// callback.
+// Invariant: however often and in whatever order the supplier calls, each
+// callback takes effect at most once and one outcome event is written per
+// change. An order that has succeeded stays succeeded: a failed callback never
+// rewrites it, and a callback with an older or equal event_seq never changes
+// the order. A succeeded callback with a newer event_seq than a recorded
+// failure is applied. A busy order is reported as ErrBusy, never as Duplicate.
+// The MongoDB unique index on raw payloads cannot be the guard, because it does
+// not commit together with the MySQL order and event.
 //
 // If a repeated callback is applied again, the invoice is moved and delivered
 // three times; if a late "failed" overwrites an issued order, the issued
 // invoice is marked failed and a second supplier issues it again, so the
-// enterprise is billed twice.
+// enterprise is billed twice; if a busy order is answered as a duplicate, the
+// supplier stops retrying and the invoice stays in issuing.
 func (h *Handler) Handle(ctx context.Context, cb Callback) (Result, error) {
 	return 0, fmt.Errorf("lesson 5: %w", errors.ErrUnsupported)
 }

@@ -4,24 +4,18 @@ package providergrpc
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
-	"regexp"
-	"runtime/debug"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
 	providerv1 "github.com/mafuky/invoice-hub/gen/invoicehub/provider/v1"
-	"github.com/mafuky/invoice-hub/internal/platform/logx"
+	"github.com/mafuky/invoice-hub/internal/platform/grpcx"
 	"github.com/mafuky/invoice-hub/internal/provider/callback"
 	"github.com/mafuky/invoice-hub/internal/provider/client"
 	"github.com/mafuky/invoice-hub/internal/provider/store"
 )
-
-const traceHeader = "x-trace-id"
 
 // CallbackHandler applies a supplier callback to its order.
 type CallbackHandler interface {
@@ -56,67 +50,30 @@ func NewServer(handler CallbackHandler, raw RawSink, orders Orders, supplier Sup
 	return &Server{handler: handler, raw: raw, orders: orders, supplier: supplier}
 }
 
-// NewGRPCServer returns a grpc.Server with s registered behind the trace and error-mapping interceptor.
+// NewGRPCServer returns a grpc.Server with s registered behind the shared interceptors.
 func NewGRPCServer(s *Server) *grpc.Server {
-	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptor, recoverPanic))
+	gs := grpcx.NewServer("provider", mapErr)
 	providerv1.RegisterProviderServiceServer(gs, s)
 	return gs
 }
 
-func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (resp any, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.ErrorContext(ctx, "provider rpc panicked", "method", info.FullMethod, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
-			resp, err = nil, status.Error(codes.Internal, "internal error")
-		}
-	}()
-	return h(ctx, req)
-}
-
-var lessonRe = regexp.MustCompile(`lesson (\d+)`)
-
-func interceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get(traceHeader); len(v) > 0 && v[0] != "" {
-			ctx = logx.WithTrace(ctx, v[0])
-		}
-	}
-	resp, err := h(ctx, req)
-	if err == nil {
-		return resp, nil
-	}
-	return nil, toStatus(ctx, info.FullMethod, err)
-}
-
-func toStatus(ctx context.Context, method string, err error) error {
-	if _, ok := status.FromError(err); ok {
-		return err
-	}
+func mapErr(ctx context.Context, method string, err error) (error, bool) {
 	switch {
-	case errors.Is(err, errors.ErrUnsupported):
-		msg := "not implemented yet"
-		if m := lessonRe.FindStringSubmatch(err.Error()); m != nil {
-			msg += " (lesson " + m[1] + ")"
-		}
-		return status.Error(codes.Unimplemented, msg)
-	case errors.Is(err, context.Canceled):
-		return status.Error(codes.Canceled, "request canceled")
-	case errors.Is(err, context.DeadlineExceeded):
-		return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+	case errors.Is(err, callback.ErrBusy):
+		return status.Error(codes.Unavailable, "order is being processed, retry"), true
 	case errors.Is(err, client.ErrSupplier):
 		slog.WarnContext(ctx, "supplier unavailable", "method", method, "err", err)
-		return status.Error(codes.Unavailable, "supplier unavailable")
+		return status.Error(codes.Unavailable, "supplier unavailable"), true
 	}
-	slog.ErrorContext(ctx, "provider rpc failed", "method", method, "err", err)
-	return status.Error(codes.Internal, "internal error")
+	return nil, false
 }
 
 // HandleCallback stores the raw payload first, so it is kept even when the
 // order is unknown or the handler fails, then lets the handler apply it.
 func (s *Server) HandleCallback(ctx context.Context, req *providerv1.CallbackRequest) (*providerv1.CallbackReply, error) {
 	outcome, ok := outcomeName(req.GetOutcome())
-	if req.GetSupplier() == "" || req.GetSupplierOrderNo() == "" || !ok {
-		return nil, status.Error(codes.InvalidArgument, "supplier, supplier_order_no and a known outcome are required")
+	if req.GetSupplier() == "" || req.GetSupplierOrderNo() == "" || !ok || req.GetEventSeq() <= 0 {
+		return nil, status.Error(codes.InvalidArgument, "supplier, supplier_order_no, a known outcome and a positive event_seq are required")
 	}
 	inserted, err := s.raw.Store(ctx, store.RawCallback{
 		Supplier: req.GetSupplier(), SupplierOrderNo: req.GetSupplierOrderNo(), EventSeq: req.GetEventSeq(),
@@ -140,7 +97,7 @@ func (s *Server) HandleCallback(ctx context.Context, req *providerv1.CallbackReq
 	case callback.UnknownOrder:
 		return nil, status.Errorf(codes.NotFound, "unknown supplier order %s/%s", req.GetSupplier(), req.GetSupplierOrderNo())
 	}
-	return nil, fmt.Errorf("callback handler returned %v", res)
+	return nil, errors.New("callback handler returned an unknown result")
 }
 
 // QueryOrder reports what the supplier says about the order of a task.
@@ -159,7 +116,7 @@ func (s *Server) QueryOrder(ctx context.Context, req *providerv1.QueryOrderReque
 	if !res.Found {
 		return &providerv1.QueryOrderReply{Found: false}, nil
 	}
-	return &providerv1.QueryOrderReply{Found: true, Outcome: orderOutcome(res.Outcome), InvoiceNo: res.InvoiceNo}, nil
+	return &providerv1.QueryOrderReply{Found: true, Outcome: orderOutcome(ctx, res.Outcome), InvoiceNo: res.InvoiceNo}, nil
 }
 
 func outcomeName(o providerv1.CallbackOutcome) (callback.Outcome, bool) {
@@ -172,7 +129,7 @@ func outcomeName(o providerv1.CallbackOutcome) (callback.Outcome, bool) {
 	return "", false
 }
 
-func orderOutcome(s string) providerv1.OrderOutcome {
+func orderOutcome(ctx context.Context, s string) providerv1.OrderOutcome {
 	switch s {
 	case "PENDING":
 		return providerv1.OrderOutcome_ORDER_OUTCOME_PENDING
@@ -181,5 +138,6 @@ func orderOutcome(s string) providerv1.OrderOutcome {
 	case "FAILED":
 		return providerv1.OrderOutcome_ORDER_OUTCOME_FAILED
 	}
+	slog.WarnContext(ctx, "supplier reported an unknown order outcome", "outcome", s)
 	return providerv1.OrderOutcome_ORDER_OUTCOME_UNSPECIFIED
 }

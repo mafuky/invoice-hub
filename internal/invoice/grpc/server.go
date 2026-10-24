@@ -5,29 +5,23 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"fmt"
-	"log/slog"
-	"regexp"
-	"runtime/debug"
 	"strconv"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	invoicev1 "github.com/mafuky/invoice-hub/gen/invoicehub/invoice/v1"
 	"github.com/mafuky/invoice-hub/internal/invoice/app"
 	"github.com/mafuky/invoice-hub/internal/invoice/domain"
-	"github.com/mafuky/invoice-hub/internal/platform/logx"
+	"github.com/mafuky/invoice-hub/internal/platform/grpcx"
 	"github.com/mafuky/invoice-hub/internal/platform/money"
 )
 
 const (
 	defaultPageSize = 50
 	maxPageSize     = 200
-	traceHeader     = "x-trace-id"
 )
 
 // Commands is the write side of the invoice service.
@@ -54,63 +48,21 @@ func NewServer(cmds Commands, reader Reader) *Server {
 	return &Server{cmds: cmds, reader: reader}
 }
 
-// NewGRPCServer returns a grpc.Server with s registered behind the trace and error-mapping interceptor.
+// NewGRPCServer returns a grpc.Server with s registered behind the shared interceptors.
 func NewGRPCServer(s *Server) *grpc.Server {
-	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptor, recoverPanic))
+	gs := grpcx.NewServer("invoice", mapErr)
 	invoicev1.RegisterInvoiceServiceServer(gs, s)
 	return gs
 }
 
-// recoverPanic keeps one failing request from taking the whole service down.
-func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (resp any, err error) {
-	defer func() {
-		if r := recover(); r != nil {
-			slog.ErrorContext(ctx, "invoice rpc panicked", "method", info.FullMethod, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
-			resp, err = nil, status.Error(codes.Internal, "internal error")
-		}
-	}()
-	return h(ctx, req)
-}
-
-var lessonRe = regexp.MustCompile(`lesson (\d+)`)
-
-// interceptor puts the caller's trace id into the context and turns domain
-// errors into gRPC status codes.
-func interceptor(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (any, error) {
-	if md, ok := metadata.FromIncomingContext(ctx); ok {
-		if v := md.Get(traceHeader); len(v) > 0 && v[0] != "" {
-			ctx = logx.WithTrace(ctx, v[0])
-		}
-	}
-	resp, err := h(ctx, req)
-	if err == nil {
-		return resp, nil
-	}
-	return nil, toStatus(ctx, info.FullMethod, err)
-}
-
-func toStatus(ctx context.Context, method string, err error) error {
-	if _, ok := status.FromError(err); ok {
-		return err
-	}
+func mapErr(_ context.Context, _ string, err error) (error, bool) {
 	switch {
-	case errors.Is(err, errors.ErrUnsupported):
-		msg := "not implemented yet"
-		if m := lessonRe.FindStringSubmatch(err.Error()); m != nil {
-			msg += " (lesson " + m[1] + ")"
-		}
-		return status.Error(codes.Unimplemented, msg)
 	case errors.Is(err, app.ErrBizOrderExists):
-		return status.Error(codes.AlreadyExists, "biz_order_no already has an invoice")
+		return status.Error(codes.AlreadyExists, "biz_order_no already has an invoice"), true
 	case errors.Is(err, domain.ErrNotFound):
-		return status.Error(codes.NotFound, "not found")
-	case errors.Is(err, context.Canceled):
-		return status.Error(codes.Canceled, "request canceled")
-	case errors.Is(err, context.DeadlineExceeded):
-		return status.Error(codes.DeadlineExceeded, "deadline exceeded")
+		return status.Error(codes.NotFound, "not found"), true
 	}
-	slog.ErrorContext(ctx, "invoice rpc failed", "method", method, "err", err)
-	return status.Error(codes.Internal, "internal error")
+	return nil, false
 }
 
 func (s *Server) Apply(ctx context.Context, req *invoicev1.ApplyRequest) (*invoicev1.ApplyReply, error) {

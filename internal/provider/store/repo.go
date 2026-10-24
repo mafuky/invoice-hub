@@ -39,6 +39,8 @@ type Order struct {
 	Outcome         string
 	InvoiceNo       string
 	Version         int
+	// LastEventSeq is the highest supplier event_seq applied to the order.
+	LastEventSeq int
 }
 
 // NewOrder is a supplier order the supplier has just accepted.
@@ -55,7 +57,7 @@ type Repo struct {
 
 func NewRepo(db *sql.DB) *Repo { return &Repo{db: db} }
 
-const orderCols = `id, task_id, invoice_id, supplier, supplier_order_no, status, outcome, invoice_no, version`
+const orderCols = `id, task_id, invoice_id, supplier, supplier_order_no, status, outcome, invoice_no, version, last_event_seq`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -64,7 +66,7 @@ func scanOrder(row rowScanner) (Order, error) {
 		o         Order
 		invoiceNo sql.NullString
 	)
-	err := row.Scan(&o.ID, &o.TaskID, &o.InvoiceID, &o.Supplier, &o.SupplierOrderNo, &o.Status, &o.Outcome, &invoiceNo, &o.Version)
+	err := row.Scan(&o.ID, &o.TaskID, &o.InvoiceID, &o.Supplier, &o.SupplierOrderNo, &o.Status, &o.Outcome, &invoiceNo, &o.Version, &o.LastEventSeq)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Order{}, ErrNotFound
 	}
@@ -151,18 +153,20 @@ func (r *Repo) ExcludedSuppliers(ctx context.Context, q DBTX, invoiceID, taskID 
 	return out, rows.Err()
 }
 
-// SetOutcome moves an order to a final status. It reports false when the
-// order is no longer at the given version.
-func (r *Repo) SetOutcome(ctx context.Context, tx *sql.Tx, id int64, version int, status, outcome, invoiceNo string) (bool, error) {
+// ApplyOutcome moves an order to status for the supplier event seq. It applies
+// only while the order is still at version and has seen no event with a
+// sequence of seq or higher; applied=false means another callback got there first.
+func (r *Repo) ApplyOutcome(ctx context.Context, tx *sql.Tx, orderID int64, version, seq int, status, outcome, invoiceNo string) (applied bool, err error) {
 	var inv any
 	if invoiceNo != "" {
 		inv = invoiceNo
 	}
 	res, err := tx.ExecContext(ctx,
-		`UPDATE provider_orders SET status = ?, outcome = ?, invoice_no = ?, version = version + 1 WHERE id = ? AND version = ?`,
-		status, outcome, inv, id, version)
+		`UPDATE provider_orders SET status = ?, outcome = ?, invoice_no = ?, last_event_seq = ?, version = version + 1
+		 WHERE id = ? AND version = ? AND last_event_seq < ?`,
+		status, outcome, inv, seq, orderID, version, seq)
 	if err != nil {
-		return false, fmt.Errorf("update provider order %d: %w", id, err)
+		return false, fmt.Errorf("update provider order %d: %w", orderID, err)
 	}
 	n, err := res.RowsAffected()
 	if err != nil {
