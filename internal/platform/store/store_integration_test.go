@@ -52,7 +52,7 @@ func TestMigrate_UpDownUp(t *testing.T) {
 			if err != nil {
 				t.Skipf("mysql unavailable: %v", err)
 			}
-			defer db.Close()
+			t.Cleanup(func() { db.Close() }) // registered first, so it runs after the teardown below
 
 			tables := listTables(t, ctx, db)
 			wasEmpty := len(tables) == 0
