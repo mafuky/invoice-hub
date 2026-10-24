@@ -56,16 +56,27 @@ func Declare(ch *amqp.Channel) error { return DeclareWithPrefix(ch, "") }
 
 // DeclareWithPrefix prefixes the exchange and every queue name, so tests can run in isolation.
 func DeclareWithPrefix(ch *amqp.Channel, prefix string) error {
+	// Prefixed queues belong to tests; let the broker reap them if a run is killed.
+	queueArgs := func(extra amqp.Table) amqp.Table {
+		args := amqp.Table{"x-queue-type": "classic"}
+		if prefix != "" {
+			args["x-expires"] = int32(10 * 60 * 1000)
+		}
+		for k, v := range extra {
+			args[k] = v
+		}
+		return args
+	}
 	ex := prefix + exchangeName
 	if err := ch.ExchangeDeclare(ex, "topic", true, false, false, false, nil); err != nil {
 		return fmt.Errorf("mq: declare exchange %s: %w", ex, err)
 	}
 	for _, b := range bindings {
 		q := prefix + b.queue
-		if _, err := ch.QueueDeclare(q, true, false, false, false, nil); err != nil {
+		if _, err := ch.QueueDeclare(q, true, false, false, false, queueArgs(nil)); err != nil {
 			return fmt.Errorf("mq: declare queue %s: %w", q, err)
 		}
-		if _, err := ch.QueueDeclare(q+parkingSuffix, true, false, false, false, nil); err != nil {
+		if _, err := ch.QueueDeclare(q+parkingSuffix, true, false, false, false, queueArgs(nil)); err != nil {
 			return fmt.Errorf("mq: declare queue %s: %w", q+parkingSuffix, err)
 		}
 		for _, key := range b.keys {
@@ -80,11 +91,11 @@ func DeclareWithPrefix(ch *amqp.Channel, prefix string) error {
 			return fmt.Errorf("mq: bind %s to %s: %w", q, retryKey, err)
 		}
 		for _, t := range tiers {
-			args := amqp.Table{
+			args := queueArgs(amqp.Table{
 				"x-message-ttl":             t.ttlMs,
 				"x-dead-letter-exchange":    ex,
 				"x-dead-letter-routing-key": retryKey,
-			}
+			})
 			if _, err := ch.QueueDeclare(q+t.suffix, true, false, false, false, args); err != nil {
 				return fmt.Errorf("mq: declare queue %s: %w", q+t.suffix, err)
 			}

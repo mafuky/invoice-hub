@@ -16,6 +16,9 @@ import (
 const defaultConfirmTimeout = 5 * time.Second
 
 // Publisher sends events and returns only after the broker has confirmed them.
+// Once its channel closes, every Publish fails with an error wrapping
+// amqp.ErrClosed; callers such as the outbox relay must treat that as fatal or
+// build a new Publisher.
 type Publisher struct {
 	mu       sync.Mutex
 	ch       *amqp.Channel
@@ -23,6 +26,7 @@ type Publisher struct {
 	exchange string
 }
 
+// NewPublisher opens a confirm-mode channel that publishes to the events exchange.
 func NewPublisher(conn *amqp.Connection) (*Publisher, error) {
 	return NewPublisherWithPrefix(conn, "")
 }
@@ -46,6 +50,9 @@ func NewPublisherWithPrefix(conn *amqp.Connection, prefix string) (*Publisher, e
 
 func (p *Publisher) Close() error { return p.ch.Close() }
 
+// IsClosed reports whether the underlying channel is gone.
+func (p *Publisher) IsClosed() bool { return p.ch.IsClosed() }
+
 // Publish waits for the broker ack. A nack, an unroutable event or a timeout is an error,
 // so the caller keeps the outbox row and sends the event again later.
 func (p *Publisher) Publish(ctx context.Context, routingKey string, env event.Envelope) error {
@@ -61,6 +68,7 @@ func (p *Publisher) Publish(ctx context.Context, routingKey string, env event.En
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	drainReturns(p.returns)
 
 	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, p.exchange, routingKey, true, false, amqp.Publishing{
 		ContentType:  "application/json",
@@ -81,10 +89,8 @@ func (p *Publisher) Publish(ctx context.Context, routingKey string, env event.En
 		return fmt.Errorf("mq: broker nacked %s (%s)", env.EventID, routingKey)
 	}
 	// A returned message is still acked by the broker, but nobody will receive it.
-	select {
-	case r := <-p.returns:
+	if r, ok := findReturn(p.returns, env.EventID); ok {
 		return fmt.Errorf("mq: %s returned unroutable: %d %s", routingKey, r.ReplyCode, r.ReplyText)
-	default:
 	}
 	return nil
 }

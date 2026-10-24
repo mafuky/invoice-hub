@@ -1,6 +1,6 @@
-package mq
-
 // Implemented in lesson 3.
+
+package mq
 
 // RetryTier picks the delay tier for an invoice event whose handler has failed
 // attempt times in a row, returning the queue-name suffix, or ok=false once the

@@ -208,10 +208,20 @@ func TestConsume_ExhaustedTiersAndPoisonGoToParking(t *testing.T) {
 	defer pub.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go Consume(ctx, conn, prefix+QueueProvider, 1, func(context.Context, event.Envelope) error {
-		return fmt.Errorf("supplier rejected BIZ-20261023-0002")
-	})
+	done := make(chan error, 1)
+	go func() {
+		done <- Consume(ctx, conn, prefix+QueueProvider, 1, func(context.Context, event.Envelope) error {
+			return fmt.Errorf("supplier rejected BIZ-20261023-0002")
+		})
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("consume did not stop after cancel")
+		}
+	}()
 	if err := pub.Publish(ctx, InvoiceTaskCreated, newEnvelope(t)); err != nil {
 		t.Fatal(err)
 	}
@@ -230,5 +240,53 @@ func TestConsume_ExhaustedTiersAndPoisonGoToParking(t *testing.T) {
 	}
 	if parked != 2 {
 		t.Fatalf("parked %d messages, want 2", parked)
+	}
+}
+
+func TestConsume_HandlerPanicGoesToRetry(t *testing.T) {
+	conn := dialOrSkip(t)
+	prefix, ch := setup(t, conn)
+	orig := retryTierImpl
+	retryTierImpl = func(attempt int) (string, bool) { return ".retry.5s", attempt == 1 }
+	defer func() { retryTierImpl = orig }()
+
+	pub, err := NewPublisherWithPrefix(conn, prefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pub.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- Consume(ctx, conn, prefix+QueueProvider, 1, func(context.Context, event.Envelope) error {
+			panic("nil supplier client")
+		})
+	}()
+	defer func() {
+		cancel()
+		<-done
+	}()
+	if err := pub.Publish(ctx, InvoiceTaskCreated, newEnvelope(t)); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if msg, ok, _ := ch.Get(prefix+QueueProvider+".retry.5s", false); ok {
+			if a, _ := msg.Headers[headerAttempt].(int32); a != 1 {
+				t.Fatalf("x-attempt = %v, want 1", msg.Headers[headerAttempt])
+			}
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("panicking event never reached .retry.5s")
+}
+
+func TestConsume_MissingTopologyFailsFast(t *testing.T) {
+	conn := dialOrSkip(t)
+	err := Consume(context.Background(), conn, fmt.Sprintf("t%08x.q.provider", rand.Uint32()), 1, nil)
+	if err == nil {
+		t.Fatal("consume on undeclared queue returned nil")
 	}
 }
