@@ -1,0 +1,234 @@
+// Command invoice-svc owns invoices, their commands and tasks.
+//
+// Subcommands: serve (gRPC plus the consume, relay and timeout loops),
+// relay-only and consume-only.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"os"
+	"os/signal"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	amqp "github.com/rabbitmq/amqp091-go"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	providerv1 "github.com/mafuky/invoice-hub/gen/invoicehub/provider/v1"
+	"github.com/mafuky/invoice-hub/internal/invoice/app"
+	invoicegrpc "github.com/mafuky/invoice-hub/internal/invoice/grpc"
+	"github.com/mafuky/invoice-hub/internal/invoice/store"
+	"github.com/mafuky/invoice-hub/internal/platform/config"
+	"github.com/mafuky/invoice-hub/internal/platform/dial"
+	"github.com/mafuky/invoice-hub/internal/platform/logx"
+	"github.com/mafuky/invoice-hub/internal/platform/mq"
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
+	platformstore "github.com/mafuky/invoice-hub/internal/platform/store"
+)
+
+const (
+	consumePrefetch     = 16
+	scanInterval        = 5 * time.Second
+	shutdownGrace       = 10 * time.Second
+	defaultCallbackWait = 2 * time.Minute
+)
+
+func main() {
+	if len(os.Args) != 2 || (os.Args[1] != "serve" && os.Args[1] != "relay-only" && os.Args[1] != "consume-only") {
+		fmt.Fprintln(os.Stderr, "usage: invoice-svc serve|relay-only|consume-only")
+		os.Exit(2)
+	}
+	log := logx.New("invoice-svc")
+	slog.SetDefault(log)
+	if err := run(os.Args[1], log); err != nil {
+		log.Error("invoice-svc stopped", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run(mode string, log *slog.Logger) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	callbackWait, err := callbackDeadline()
+	if err != nil {
+		return err
+	}
+
+	db, err := platformstore.OpenMySQL(ctx, cfg.MySQLDSNInvoice)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := platformstore.MigrateMySQL(ctx, cfg.MySQLDSNInvoice, "invoice"); err != nil {
+		return err
+	}
+
+	conn, err := dialAMQP(cfg.AMQPURL)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := declareTopology(conn); err != nil {
+		return err
+	}
+	log.Info("queues declared")
+
+	repo := store.NewRepo(db)
+	events := app.NewEvents(db, repo, callbackWait)
+
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	loops := loopGroup{errc: make(chan error, 4)}
+
+	var gs *grpc.Server
+	if mode == "serve" {
+		providerConn, err := grpc.NewClient(dialTarget(cfg.ProviderAddr), grpc.WithTransportCredentials(insecure.NewCredentials()))
+		if err != nil {
+			return fmt.Errorf("provider client: %w", err)
+		}
+		defer providerConn.Close()
+
+		lis, err := net.Listen("tcp", cfg.InvoiceAddr)
+		if err != nil {
+			return fmt.Errorf("listen %s: %w", cfg.InvoiceAddr, err)
+		}
+		gs = invoicegrpc.NewGRPCServer(invoicegrpc.NewServer(app.NewService(db, repo), repo))
+		log.Info("listening " + cfg.InvoiceAddr)
+		loops.start("grpc", func() error { return gs.Serve(lis) })
+
+		scanner := app.NewScanner(db, repo, providerv1.NewProviderServiceClient(providerConn))
+		loops.start("timeout scanner", func() error { return scanner.Run(runCtx, scanInterval) })
+	}
+	if mode == "serve" || mode == "consume-only" {
+		loops.start("consume", func() error {
+			return mq.Consume(runCtx, conn, mq.QueueInvoice, consumePrefetch, events.Handle)
+		})
+	}
+	if mode == "serve" || mode == "relay-only" {
+		pub, err := mq.NewPublisher(conn)
+		if err != nil {
+			return err
+		}
+		defer pub.Close()
+		relay := outbox.NewRelay(db, pub, "invoice")
+		loops.start("relay", func() error { return relay.Run(runCtx) })
+	}
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+		log.Info("shutting down")
+	case runErr = <-loops.errc:
+		log.Error("background loop failed, shutting down", "err", runErr)
+	}
+
+	cancel()
+	if gs != nil {
+		stopped := make(chan struct{})
+		go func() { gs.GracefulStop(); close(stopped) }()
+		select {
+		case <-stopped:
+		case <-time.After(shutdownGrace):
+			gs.Stop()
+		}
+	}
+	if !loops.wait(shutdownGrace) {
+		log.Warn("loops did not stop within the grace period")
+	}
+	return runErr
+}
+
+// loopGroup runs background loops and reports the first one that fails.
+// A loop that returns nil before shutdown counts as a failure too.
+type loopGroup struct {
+	wg   sync.WaitGroup
+	errc chan error
+}
+
+func (g *loopGroup) start(name string, fn func() error) {
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		err := fn()
+		if err == nil {
+			err = errors.New("stopped unexpectedly")
+		}
+		if errors.Is(err, grpc.ErrServerStopped) {
+			return
+		}
+		select {
+		case g.errc <- fmt.Errorf("%s: %w", name, err):
+		default:
+		}
+	}()
+}
+
+func (g *loopGroup) wait(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() { g.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
+func callbackDeadline() (time.Duration, error) {
+	v := os.Getenv("INVHUB_CALLBACK_DEADLINE")
+	if v == "" {
+		return defaultCallbackWait, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, errors.New("INVHUB_CALLBACK_DEADLINE must be a positive duration such as 2m")
+	}
+	return d, nil
+}
+
+// dialAMQP checks the broker is reachable first so a closed tunnel fails fast
+// with a hint. Errors never include the URL, which carries the password.
+func dialAMQP(raw string) (*amqp.Connection, error) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return nil, errors.New("amqp: invalid INVHUB_AMQP_URL")
+	}
+	if err := dial.Check(u.Host, 5*time.Second, "run `make tunnel`"); err != nil {
+		return nil, fmt.Errorf("amqp: %w", err)
+	}
+	conn, err := amqp.Dial(raw)
+	if err != nil {
+		return nil, errors.New("amqp: connect to " + u.Host + " failed")
+	}
+	return conn, nil
+}
+
+func declareTopology(conn *amqp.Connection) error {
+	ch, err := conn.Channel()
+	if err != nil {
+		return fmt.Errorf("amqp: open channel: %w", err)
+	}
+	defer ch.Close()
+	return mq.Declare(ch)
+}
+
+// dialTarget turns ":9102" into an address gRPC can dial.
+func dialTarget(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "127.0.0.1" + addr
+	}
+	return addr
+}
