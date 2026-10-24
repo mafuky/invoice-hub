@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 var required = map[string]string{
@@ -192,5 +193,34 @@ func TestLoadMock_NoMiddlewareKeysNeeded(t *testing.T) {
 	t.Setenv("INVHUB_MOCK_ADDR", ":9999")
 	if c, _ := LoadMock(); c.Addr != ":9999" {
 		t.Fatalf("override: %+v", c)
+	}
+}
+
+func TestConfig_CallbackDeadline(t *testing.T) {
+	dir := isolate(t)
+	setRequired(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CallbackDeadline != 2*time.Minute {
+		t.Fatalf("default = %v, want 2m", cfg.CallbackDeadline)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte("INVHUB_CALLBACK_DEADLINE=45s\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.CallbackDeadline != 45*time.Second {
+		t.Fatalf("from .env = %v, want 45s", cfg.CallbackDeadline)
+	}
+
+	t.Setenv("INVHUB_CALLBACK_DEADLINE", "soon")
+	if _, err := Load(); err == nil {
+		t.Fatal("an invalid duration was accepted")
 	}
 }

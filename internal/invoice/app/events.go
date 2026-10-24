@@ -39,6 +39,14 @@ type Plan struct {
 
 	// Emit is the routing key of the event to write to the outbox once the invoice has moved.
 	Emit string
+	// Reopen asks for a replacement task after a failed issue attempt.
+	Reopen bool
+	// IssueReplacement asks for the new invoice of a reissue once the old one is red flushed.
+	IssueReplacement bool
+	// Ack drops a duplicate outcome of a task that is already finished.
+	Ack bool
+	// Flag drops a late success of a task that was already given up, and records it for operators.
+	Flag bool
 	// GaveUp marks a delivery that exhausted its retries and needs an operator.
 	GaveUp bool
 	// NeedsOperator marks a failed red flush: the invoice stays as it is until someone handles it.
@@ -47,9 +55,10 @@ type Plan struct {
 
 // PlanFor maps a routing key and its payload to the transitions they cause.
 // The command kind of the task and the invoice's current state decide which
-// path applies: issuing (ISSUE, SUPPLEMENT, REISSUE) or red flush (RED_FLUSH).
+// path applies: issuing (ISSUE, SUPPLEMENT) or red flush (RED_FLUSH, REISSUE).
+// The task's current status separates new outcomes from duplicates and late ones.
 // It does no I/O, so the whole mapping can be tested without a database.
-func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStatus, kind string) (Plan, error) {
+func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStatus, kind string, taskStatus domain.TaskStatus) (Plan, error) {
 	switch routingKey {
 	case mq.ProviderTaskSubmitted:
 		var p event.TaskSubmitted
@@ -70,7 +79,7 @@ func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStat
 			if invoiceStatus != domain.InvoiceIssuing {
 				plan.InvoiceFrom, plan.InvoiceTo = domain.InvoiceApplying, domain.InvoiceIssuing
 			}
-		case kind == domain.KindRedFlush:
+		case isRedKind(kind):
 			if invoiceStatus != domain.InvoiceRedFlushing {
 				plan.InvoiceFrom, plan.InvoiceTo = domain.InvoiceIssued, domain.InvoiceRedFlushing
 			}
@@ -84,6 +93,12 @@ func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStat
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return Plan{}, fmt.Errorf("decode %s: %w", routingKey, err)
 		}
+		if taskStatus == domain.TaskDone {
+			return Plan{TaskID: p.TaskID, InvoiceID: p.InvoiceID, Ack: true}, nil
+		}
+		if taskStatus == domain.TaskFailed {
+			return Plan{TaskID: p.TaskID, InvoiceID: p.InvoiceID, Flag: true}, nil
+		}
 		plan := Plan{
 			TaskID: p.TaskID, InvoiceID: p.InvoiceID,
 			TaskSteps: []TaskStep{{domain.TaskWaitingCallback, domain.TaskDone}},
@@ -96,8 +111,9 @@ func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStat
 			plan.InvoiceFrom, plan.InvoiceTo = domain.InvoiceIssuing, domain.InvoiceIssued
 			plan.InvoiceNo = p.InvoiceNo
 			plan.Emit = mq.InvoiceIssued
-		case kind == domain.KindRedFlush:
+		case isRedKind(kind):
 			plan.InvoiceFrom, plan.InvoiceTo = domain.InvoiceRedFlushing, domain.InvoiceRedFlushed
+			plan.IssueReplacement = kind == domain.KindReissue
 		default:
 			return Plan{}, fmt.Errorf("%s for task %d: unknown command kind %q", routingKey, p.TaskID, kind)
 		}
@@ -108,13 +124,17 @@ func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStat
 		if err := json.Unmarshal(payload, &p); err != nil {
 			return Plan{}, fmt.Errorf("decode %s: %w", routingKey, err)
 		}
+		if taskStatus == domain.TaskDone || taskStatus == domain.TaskFailed {
+			return Plan{TaskID: p.TaskID, InvoiceID: p.InvoiceID, Ack: true}, nil
+		}
 		plan := Plan{
 			TaskID: p.TaskID, InvoiceID: p.InvoiceID,
 			TaskSteps: []TaskStep{{domain.TaskWaitingCallback, domain.TaskFailed}},
 		}
 		switch {
 		case isIssueKind(kind):
-		case kind == domain.KindRedFlush:
+			plan.Reopen = true
+		case isRedKind(kind):
 			plan.NeedsOperator = true
 		default:
 			return Plan{}, fmt.Errorf("%s for task %d: unknown command kind %q", routingKey, p.TaskID, kind)
@@ -153,7 +173,11 @@ func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStat
 }
 
 func isIssueKind(kind string) bool {
-	return kind == domain.KindIssue || kind == domain.KindSupplement || kind == domain.KindReissue
+	return kind == domain.KindIssue || kind == domain.KindSupplement
+}
+
+func isRedKind(kind string) bool {
+	return kind == domain.KindRedFlush || kind == domain.KindReissue
 }
 
 // refs pulls the task and invoice ids every invoice-related payload carries.
@@ -172,6 +196,7 @@ func refs(payload []byte) (taskID, invoiceID int64, err error) {
 type Events struct {
 	db       *sql.DB
 	repo     *store.Repo
+	svc      *Service
 	deadline time.Duration
 	now      func() time.Time
 }
@@ -179,7 +204,7 @@ type Events struct {
 // NewEvents builds the event handler; callbackDeadline is how long a supplier
 // may take to call back before the timeout scanner steps in.
 func NewEvents(db *sql.DB, repo *store.Repo, callbackDeadline time.Duration) *Events {
-	return &Events{db: db, repo: repo, deadline: callbackDeadline, now: time.Now}
+	return &Events{db: db, repo: repo, svc: NewService(db, repo), deadline: callbackDeadline, now: time.Now}
 }
 
 // Handle is the mq.Handler of q.invoice. A returned error sends the event to
@@ -232,7 +257,7 @@ func (e *Events) applyPayload(ctx context.Context, tx *sql.Tx, key string, paylo
 		return err
 	}
 
-	p, err := PlanFor(key, payload, inv.Status, kind)
+	p, err := PlanFor(key, payload, inv.Status, kind, task.Status)
 	if err != nil {
 		return err
 	}
@@ -240,6 +265,17 @@ func (e *Events) applyPayload(ctx context.Context, tx *sql.Tx, key string, paylo
 }
 
 func (e *Events) execute(ctx context.Context, tx *sql.Tx, p Plan, task domain.Task, inv domain.Invoice, key, eventID, traceID string) error {
+	switch {
+	case p.Ack:
+		slog.InfoContext(ctx, "outcome for a finished task, ignored",
+			"task_id", p.TaskID, "invoice_id", p.InvoiceID, "event_id", eventID, "type", key)
+		return nil
+	case p.Flag:
+		slog.ErrorContext(ctx, "supplier issued an invoice for a task already given up, possible double issue",
+			"task_id", p.TaskID, "invoice_id", p.InvoiceID, "event_id", eventID)
+		return e.repo.AppendStateLog(ctx, tx, store.EntityTask, p.TaskID,
+			string(domain.TaskFailed), string(domain.TaskFailed), "late_outcome", eventID)
+	}
 	if p.GaveUp {
 		slog.ErrorContext(ctx, "delivery gave up, invoice needs an operator",
 			"invoice_id", p.InvoiceID, "event_id", eventID)
@@ -256,6 +292,11 @@ func (e *Events) execute(ctx context.Context, tx *sql.Tx, p Plan, task domain.Ta
 			return fmt.Errorf("task %d is not %s at version %d, %s arrived out of order", p.TaskID, st.From, version, key)
 		}
 		version++
+	}
+	if p.Reopen {
+		if _, err := e.svc.Reopen(ctx, tx, p.InvoiceID, task.CommandID, p.TaskID); err != nil {
+			return err
+		}
 	}
 	if p.SetDeadline {
 		if err := e.repo.SetTaskDeadline(ctx, tx, p.TaskID, e.now().Add(e.deadline)); err != nil {
@@ -282,6 +323,11 @@ func (e *Events) execute(ctx context.Context, tx *sql.Tx, p Plan, task domain.Ta
 		}
 	}
 
+	if p.IssueReplacement {
+		if _, err := e.svc.IssueReplacement(ctx, tx, p.InvoiceID, task.CommandID); err != nil {
+			return err
+		}
+	}
 	if p.Emit != "" {
 		return e.emit(ctx, tx, p, traceID)
 	}

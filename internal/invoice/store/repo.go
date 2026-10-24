@@ -270,3 +270,19 @@ func (r *Repo) GetCommand(ctx context.Context, q DBTX, id int64) (domain.Command
 	c.Status = domain.CommandStatus(status)
 	return c, nil
 }
+
+// AppendStateLog writes a state_log row without changing any entity, for
+// events that are noted rather than applied.
+func (r *Repo) AppendStateLog(ctx context.Context, q DBTX, entity string, id int64, from, to, cause, eventID string) error {
+	var ev any
+	if eventID != "" {
+		ev = eventID
+	}
+	_, err := q.ExecContext(ctx,
+		`INSERT INTO state_log (entity, entity_id, from_status, to_status, cause, event_id) VALUES (?, ?, ?, ?, ?, ?)`,
+		entity, id, from, to, cause, ev)
+	if err != nil {
+		return fmt.Errorf("store: append state_log for %s %d: %w", entity, id, err)
+	}
+	return nil
+}

@@ -32,9 +32,9 @@ func NewScanner(db *sql.DB, repo *store.Repo, provider providerv1.ProviderServic
 // invoice was issued. A found result must be applied through
 // Events.ApplyOutcome, so the task move, the invoice move, invoice_no and the
 // issued event commit in one transaction exactly as a callback's would. If
-// the supplier has no such order, the task is marked failed and a new pending
-// task with no supplier is created for the same command, with a "task
-// created" outbox event, so provider-svc picks the next supplier.
+// the supplier has no such order, the task is marked failed and the
+// replacement must be created through Service.Reopen, in the same
+// transaction, so provider-svc picks the next supplier.
 //
 // Invariant: an order the supplier has already issued is never reordered, and a
 // timed-out order the supplier does not know is retried exactly once per

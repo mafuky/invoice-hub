@@ -56,7 +56,7 @@ func NewServer(cmds Commands, reader Reader) *Server {
 
 // NewGRPCServer returns a grpc.Server with s registered behind the trace and error-mapping interceptor.
 func NewGRPCServer(s *Server) *grpc.Server {
-	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(recoverPanic, interceptor))
+	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptor, recoverPanic))
 	invoicev1.RegisterInvoiceServiceServer(gs, s)
 	return gs
 }
@@ -100,6 +100,8 @@ func toStatus(ctx context.Context, method string, err error) error {
 			msg += " (lesson " + m[1] + ")"
 		}
 		return status.Error(codes.Unimplemented, msg)
+	case errors.Is(err, app.ErrBizOrderExists):
+		return status.Error(codes.AlreadyExists, "biz_order_no already has an invoice")
 	case errors.Is(err, domain.ErrNotFound):
 		return status.Error(codes.NotFound, "not found")
 	case errors.Is(err, context.Canceled):

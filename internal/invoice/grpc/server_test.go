@@ -59,8 +59,9 @@ func (f *fakeRepo) ListInvoices(_ context.Context, status string, after int64, l
 // fakeCommands stands in for the use cases; every command fails like an
 // unfinished lesson unless a test overrides it.
 type fakeCommands struct {
-	trace   string
-	panicOn bool
+	trace         string
+	panicOn       bool
+	supplementErr error
 }
 
 func (c *fakeCommands) Apply(ctx context.Context, _ app.ApplyInput) (int64, bool, error) {
@@ -80,6 +81,9 @@ func (c *fakeCommands) Reissue(context.Context, int64, string) (int64, error) {
 }
 
 func (c *fakeCommands) Supplement(context.Context, app.ApplyInput) (int64, int64, error) {
+	if c.supplementErr != nil {
+		return 0, 0, c.supplementErr
+	}
 	return 0, 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
 
@@ -241,5 +245,16 @@ func TestGRPC_HandlerPanic_ReturnsInternalAndServiceKeepsServing(t *testing.T) {
 	}
 	if _, err := client.Get(context.Background(), &invoicev1.GetRequest{InvoiceId: 1}); err != nil {
 		t.Fatalf("service stopped answering after a panic: %v", err)
+	}
+}
+
+func TestGRPC_SupplementOnUsedBizOrderNo_AlreadyExists(t *testing.T) {
+	client := start(t, &fakeCommands{supplementErr: fmt.Errorf("supplement: %w", app.ErrBizOrderExists)}, seeded(1))
+	_, err := client.Supplement(context.Background(), &invoicev1.SupplementRequest{
+		BizOrderNo: "BIZ-20261023-0001", ProductLine: invoicev1.ProductLine_PRODUCT_LINE_FLIGHT,
+		Title: "Example Travel Co., Ltd.", TaxNo: "91310000EXAMPLE001", Amount: "1999.99", CustomerId: "CUST-0001",
+	})
+	if status.Code(err) != codes.AlreadyExists {
+		t.Fatalf("code = %v, want AlreadyExists", status.Code(err))
 	}
 }
