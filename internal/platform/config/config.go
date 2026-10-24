@@ -41,6 +41,11 @@ type Config struct {
 
 	// CallbackDeadline is how long invoice-svc waits for a supplier callback before querying the order.
 	CallbackDeadline time.Duration
+
+	// DeliveryTimeout bounds one push to the customer endpoint or the finance center.
+	DeliveryTimeout time.Duration
+	// DeliveryStuckAfter is how long a delivery may stay in delivering before it is taken back.
+	DeliveryStuckAfter time.Duration
 }
 
 var keyRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
@@ -50,6 +55,9 @@ const (
 	defaultMockCallbackURL = "http://127.0.0.1:8080/callbacks"
 
 	defaultCallbackDeadline = 2 * time.Minute
+
+	defaultDeliveryTimeout    = 2 * time.Second
+	defaultDeliveryStuckAfter = 2 * time.Minute
 )
 
 // source resolves keys from the process environment, then the .env file.
@@ -154,7 +162,25 @@ func Load() (Config, error) {
 		}
 		c.CallbackDeadline = d
 	}
+	if c.DeliveryTimeout, err = positiveDuration(get, "INVHUB_DELIVERY_TIMEOUT", defaultDeliveryTimeout, "2s"); err != nil {
+		return Config{}, err
+	}
+	if c.DeliveryStuckAfter, err = positiveDuration(get, "INVHUB_DELIVERY_STUCK_AFTER", defaultDeliveryStuckAfter, "2m"); err != nil {
+		return Config{}, err
+	}
 	return c, nil
+}
+
+func positiveDuration(get func(key, def string, required bool) string, key string, def time.Duration, example string) (time.Duration, error) {
+	v := get(key, "", false)
+	if v == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("config: %s must be a positive duration such as %s", key, example)
+	}
+	return d, nil
 }
 
 func repoRoot() (string, bool) {
@@ -254,6 +280,8 @@ func (c Config) redacted() []slog.Attr {
 		slog.String("mock_url", c.MockURL),
 		slog.String("mock_callback_url", c.MockCallbackURL),
 		slog.String("callback_deadline", c.CallbackDeadline.String()),
+		slog.String("delivery_timeout", c.DeliveryTimeout.String()),
+		slog.String("delivery_stuck_after", c.DeliveryStuckAfter.String()),
 	}
 }
 

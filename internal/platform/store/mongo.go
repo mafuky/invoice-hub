@@ -43,6 +43,12 @@ func EnsureMongoIndexes(ctx context.Context, db *mongo.Database) error {
 	return ensureIndexes(ctx, db, "")
 }
 
+// EnsureMongoIndexesWithPrefix creates the same indexes on collections whose names
+// carry prefix, so tests can work in collections of their own.
+func EnsureMongoIndexesWithPrefix(ctx context.Context, db *mongo.Database, prefix string) error {
+	return ensureIndexes(ctx, db, prefix)
+}
+
 func ensureIndexes(ctx context.Context, db *mongo.Database, prefix string) error {
 	uniq := func(name string, keys bson.D) mongo.IndexModel {
 		return mongo.IndexModel{Keys: keys, Options: options.Index().SetName(name).SetUnique(true)}

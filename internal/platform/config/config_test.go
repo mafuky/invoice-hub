@@ -224,3 +224,38 @@ func TestConfig_CallbackDeadline(t *testing.T) {
 		t.Fatal("an invalid duration was accepted")
 	}
 }
+
+func TestConfig_DeliveryDurations(t *testing.T) {
+	dir := isolate(t)
+	setRequired(t)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DeliveryTimeout != 2*time.Second || cfg.DeliveryStuckAfter != 2*time.Minute {
+		t.Fatalf("defaults = %v / %v, want 2s / 2m", cfg.DeliveryTimeout, cfg.DeliveryStuckAfter)
+	}
+
+	env := "INVHUB_DELIVERY_TIMEOUT=500ms\nINVHUB_DELIVERY_STUCK_AFTER=90s\n"
+	if err := os.WriteFile(filepath.Join(dir, ".env"), []byte(env), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.DeliveryTimeout != 500*time.Millisecond || cfg.DeliveryStuckAfter != 90*time.Second {
+		t.Fatalf("from .env = %v / %v", cfg.DeliveryTimeout, cfg.DeliveryStuckAfter)
+	}
+
+	for _, key := range []string{"INVHUB_DELIVERY_TIMEOUT", "INVHUB_DELIVERY_STUCK_AFTER"} {
+		for _, bad := range []string{"soon", "0s", "-1m"} {
+			t.Setenv(key, bad)
+			if _, err := Load(); err == nil {
+				t.Fatalf("%s=%q was accepted", key, bad)
+			}
+		}
+		t.Setenv(key, "")
+	}
+}
