@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"regexp"
+	"runtime/debug"
 	"strconv"
 
 	"google.golang.org/grpc"
@@ -54,9 +56,20 @@ func NewServer(cmds Commands, reader Reader) *Server {
 
 // NewGRPCServer returns a grpc.Server with s registered behind the trace and error-mapping interceptor.
 func NewGRPCServer(s *Server) *grpc.Server {
-	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(interceptor))
+	gs := grpc.NewServer(grpc.ChainUnaryInterceptor(recoverPanic, interceptor))
 	invoicev1.RegisterInvoiceServiceServer(gs, s)
 	return gs
+}
+
+// recoverPanic keeps one failing request from taking the whole service down.
+func recoverPanic(ctx context.Context, req any, info *grpc.UnaryServerInfo, h grpc.UnaryHandler) (resp any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "invoice rpc panicked", "method", info.FullMethod, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			resp, err = nil, status.Error(codes.Internal, "internal error")
+		}
+	}()
+	return h(ctx, req)
 }
 
 var lessonRe = regexp.MustCompile(`lesson (\d+)`)

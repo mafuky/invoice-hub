@@ -54,7 +54,9 @@ func Backoff(attempts int) time.Duration {
 //
 // Invariant: a row is marked sent only after the broker confirmed it, and a
 // row that failed to send is retried later and never skipped; two relays
-// working on the same table must not send the same event.
+// working on the same table must not send the same event. A publisher-closed
+// error (one wrapping amqp.ErrClosed) aborts the pass and is returned, and the
+// row is not marked failed; Run treats it as fatal so the process restarts.
 //
 // If an invoice's "task created" event is lost, the invoice stays in
 // applying forever and no supplier is ever asked to issue it; if it is sent

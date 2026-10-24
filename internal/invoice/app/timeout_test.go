@@ -59,7 +59,7 @@ func TestScanner_TimeoutQueriesThenReopens(t *testing.T) {
 	}
 
 	provider := &noSuchOrder{}
-	sc := NewScanner(db, repo, provider)
+	sc := NewScanner(db, repo, provider, NewEvents(db, repo, 2*time.Minute))
 	handled, err := sc.RunOnce(ctx)
 	if err != nil {
 		t.Fatal(err)

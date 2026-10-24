@@ -23,27 +23,41 @@ func mustJSON(t *testing.T, v any) []byte {
 func TestEvents_MapsRoutingKeysToTransitions(t *testing.T) {
 	outcome := event.TaskOutcome{TaskID: 11, InvoiceID: 7, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-0001", InvoiceNo: "AIR-A-12345678"}
 	failed := event.TaskOutcome{TaskID: 11, InvoiceID: 7, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-0001", Reason: "supplier rejected title"}
+	submitted := event.TaskSubmitted{TaskID: 11, InvoiceID: 7, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-0001"}
+	toWaiting := []TaskStep{{domain.TaskPending, domain.TaskRunning}, {domain.TaskRunning, domain.TaskWaitingCallback}}
 
 	cases := []struct {
-		name string
-		key  string
-		body any
-		want Plan
+		name   string
+		key    string
+		body   any
+		status domain.InvoiceStatus
+		kind   string
+		want   Plan
 	}{
 		{
-			"supplier accepted the order",
-			mq.ProviderTaskSubmitted,
-			event.TaskSubmitted{TaskID: 11, InvoiceID: 7, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-0001"},
+			"supplier accepted the first order",
+			mq.ProviderTaskSubmitted, submitted, domain.InvoiceApplying, domain.KindIssue,
 			Plan{
-				TaskID: 11, InvoiceID: 7,
-				TaskSteps:   []TaskStep{{domain.TaskPending, domain.TaskRunning}, {domain.TaskRunning, domain.TaskWaitingCallback}},
-				SetDeadline: true,
+				TaskID: 11, InvoiceID: 7, TaskSteps: toWaiting, SetDeadline: true,
+				InvoiceFrom: domain.InvoiceApplying, InvoiceTo: domain.InvoiceIssuing,
+			},
+		},
+		{
+			"reopened task on a new supplier leaves the issuing invoice alone",
+			mq.ProviderTaskSubmitted, submitted, domain.InvoiceIssuing, domain.KindIssue,
+			Plan{TaskID: 11, InvoiceID: 7, TaskSteps: toWaiting, SetDeadline: true},
+		},
+		{
+			"supplement order accepted",
+			mq.ProviderTaskSubmitted, submitted, domain.InvoiceApplying, domain.KindSupplement,
+			Plan{
+				TaskID: 11, InvoiceID: 7, TaskSteps: toWaiting, SetDeadline: true,
 				InvoiceFrom: domain.InvoiceApplying, InvoiceTo: domain.InvoiceIssuing,
 			},
 		},
 		{
 			"supplier callback succeeded",
-			mq.ProviderTaskSucceeded, outcome,
+			mq.ProviderTaskSucceeded, outcome, domain.InvoiceIssuing, domain.KindIssue,
 			Plan{
 				TaskID: 11, InvoiceID: 7,
 				TaskSteps:   []TaskStep{{domain.TaskWaitingCallback, domain.TaskDone}},
@@ -53,31 +67,55 @@ func TestEvents_MapsRoutingKeysToTransitions(t *testing.T) {
 		},
 		{
 			"supplier callback failed leaves the invoice for the timeout or reopen path",
-			mq.ProviderTaskFailed, failed,
+			mq.ProviderTaskFailed, failed, domain.InvoiceIssuing, domain.KindIssue,
 			Plan{TaskID: 11, InvoiceID: 7, TaskSteps: []TaskStep{{domain.TaskWaitingCallback, domain.TaskFailed}}},
 		},
 		{
+			"red flush order accepted",
+			mq.ProviderTaskSubmitted, submitted, domain.InvoiceIssued, domain.KindRedFlush,
+			Plan{
+				TaskID: 11, InvoiceID: 7, TaskSteps: toWaiting, SetDeadline: true,
+				InvoiceFrom: domain.InvoiceIssued, InvoiceTo: domain.InvoiceRedFlushing,
+			},
+		},
+		{
+			"red flush succeeded issues no new invoice event",
+			mq.ProviderTaskSucceeded, event.TaskOutcome{TaskID: 11, InvoiceID: 7, Supplier: "air-a", InvoiceNo: "AIR-A-R-0001"},
+			domain.InvoiceRedFlushing, domain.KindRedFlush,
+			Plan{
+				TaskID: 11, InvoiceID: 7,
+				TaskSteps:   []TaskStep{{domain.TaskWaitingCallback, domain.TaskDone}},
+				InvoiceFrom: domain.InvoiceRedFlushing, InvoiceTo: domain.InvoiceRedFlushed,
+			},
+		},
+		{
+			"red flush failed keeps the invoice and calls an operator",
+			mq.ProviderTaskFailed, failed, domain.InvoiceRedFlushing, domain.KindRedFlush,
+			Plan{
+				TaskID: 11, InvoiceID: 7,
+				TaskSteps:     []TaskStep{{domain.TaskWaitingCallback, domain.TaskFailed}},
+				NeedsOperator: true,
+			},
+		},
+		{
 			"customer push and finance write-back done",
-			mq.DeliverySucceeded,
-			event.DeliveryDone{InvoiceID: 7, InvoiceVersion: 3},
+			mq.DeliverySucceeded, event.DeliveryDone{InvoiceID: 7, InvoiceVersion: 3}, domain.InvoiceIssued, "",
 			Plan{InvoiceID: 7, InvoiceFrom: domain.InvoiceIssued, InvoiceTo: domain.InvoiceDelivered, Emit: mq.InvoiceDelivered},
 		},
 		{
 			"delivery gave up stays issued for an operator",
-			mq.DeliveryGaveUp,
-			event.DeliveryDone{InvoiceID: 7, InvoiceVersion: 3},
+			mq.DeliveryGaveUp, event.DeliveryDone{InvoiceID: 7, InvoiceVersion: 3}, domain.InvoiceIssued, "",
 			Plan{InvoiceID: 7, GaveUp: true},
 		},
 		{
 			"delivered invoice added to the settlement",
-			mq.SettlementItemAdded,
-			event.ItemAdded{InvoiceID: 7, SettlementID: 5},
+			mq.SettlementItemAdded, event.ItemAdded{InvoiceID: 7, SettlementID: 5}, domain.InvoiceDelivered, "",
 			Plan{InvoiceID: 7, InvoiceFrom: domain.InvoiceDelivered, InvoiceTo: domain.InvoiceClosed},
 		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			got, err := PlanFor(c.key, mustJSON(t, c.body))
+			got, err := PlanFor(c.key, mustJSON(t, c.body), c.status, c.kind)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -90,13 +128,13 @@ func TestEvents_MapsRoutingKeysToTransitions(t *testing.T) {
 
 func TestEvents_SucceededWithoutInvoiceNo_Rejected(t *testing.T) {
 	body := mustJSON(t, event.TaskOutcome{TaskID: 11, InvoiceID: 7, Supplier: "air-a"})
-	if _, err := PlanFor(mq.ProviderTaskSucceeded, body); err == nil {
+	if _, err := PlanFor(mq.ProviderTaskSucceeded, body, domain.InvoiceIssuing, domain.KindIssue); err == nil {
 		t.Fatal("a success callback without an invoice number was accepted")
 	}
 }
 
 func TestEvents_UnknownRoutingKey_Rejected(t *testing.T) {
-	if _, err := PlanFor("provider.task.exploded", []byte(`{}`)); err == nil {
+	if _, err := PlanFor("provider.task.exploded", []byte(`{}`), domain.InvoiceIssuing, domain.KindIssue); err == nil {
 		t.Fatal("unknown routing key was accepted")
 	}
 }

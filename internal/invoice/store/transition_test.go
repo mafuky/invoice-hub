@@ -27,10 +27,10 @@ func seedInvoice(t *testing.T, r *Repo) int64 {
 	return id
 }
 
-func stateLogRows(t *testing.T, r *Repo, entity string, id int64) int {
+func stateLogRows(t *testing.T, q DBTX, entity string, id int64) int {
 	t.Helper()
 	var n int
-	err := r.db.QueryRow(`SELECT COUNT(*) FROM state_log WHERE entity = ? AND entity_id = ?`, entity, id).Scan(&n)
+	err := q.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM state_log WHERE entity = ? AND entity_id = ?`, entity, id).Scan(&n)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,7 +58,7 @@ func TestTransitionInvoice_VersionMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := stateLogRows(t, r, "invoice", id); n != 0 {
+	if n := stateLogRows(t, r.db, EntityInvoice, id); n != 0 {
 		t.Fatalf("state_log has %d rows for a refused transition", n)
 	}
 	inv, err := r.GetInvoice(ctx, id)
@@ -88,7 +88,7 @@ func TestTransitionInvoice_AppliedWritesOneStateLogRow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if n := stateLogRows(t, r, "invoice", id); n != 1 {
+	if n := stateLogRows(t, r.db, EntityInvoice, id); n != 1 {
 		t.Fatalf("state_log rows = %d, want 1", n)
 	}
 	inv, err := r.GetInvoice(ctx, id)
@@ -115,7 +115,50 @@ func TestTransitionInvoice_IllegalJump_Refused(t *testing.T) {
 	if applied {
 		t.Fatal("applying -> delivered must be refused")
 	}
-	if n := stateLogRows(t, r, "invoice", id); n != 0 {
+	if n := stateLogRows(t, tx, EntityInvoice, id); n != 0 {
 		t.Fatalf("state_log has %d rows for a refused jump", n)
+	}
+}
+
+func TestTransitionTask_TwoStepChainInOneTx(t *testing.T) {
+	ctx := context.Background()
+	r := NewRepo(testenv.OpenMySQL(t, "invoice"))
+	invoiceID := seedInvoice(t, r)
+	cmdID, err := r.InsertCommand(ctx, r.db, invoiceID, domain.KindIssue, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := r.InsertTask(ctx, r.db, cmdID, invoiceID, "air-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	ev := "44444444-4444-4444-4444-444444444444"
+	applied, err := r.TransitionTask(ctx, tx, taskID, domain.TaskPending, domain.TaskRunning, 0, "provider.task.submitted", ev)
+	if err != nil || !applied {
+		t.Fatalf("pending -> running: applied=%v err=%v", applied, err)
+	}
+	applied, err = r.TransitionTask(ctx, tx, taskID, domain.TaskRunning, domain.TaskWaitingCallback, 1, "provider.task.submitted", ev)
+	if err != nil || !applied {
+		t.Fatalf("running -> waiting_callback at version 1: applied=%v err=%v", applied, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	task, err := r.GetTask(ctx, r.db, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != domain.TaskWaitingCallback || task.Version != 2 {
+		t.Fatalf("task after chain: status=%s version=%d, want waiting_callback and 2", task.Status, task.Version)
+	}
+	if n := stateLogRows(t, r.db, EntityTask, taskID); n != 2 {
+		t.Fatalf("state_log rows = %d, want 2", n)
 	}
 }

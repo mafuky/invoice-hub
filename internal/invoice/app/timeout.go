@@ -19,19 +19,22 @@ type Scanner struct {
 	db       *sql.DB
 	repo     *store.Repo
 	provider providerv1.ProviderServiceClient
+	events   *Events
 	now      func() time.Time
 }
 
-func NewScanner(db *sql.DB, repo *store.Repo, provider providerv1.ProviderServiceClient) *Scanner {
-	return &Scanner{db: db, repo: repo, provider: provider, now: time.Now}
+func NewScanner(db *sql.DB, repo *store.Repo, provider providerv1.ProviderServiceClient, events *Events) *Scanner {
+	return &Scanner{db: db, repo: repo, provider: provider, events: events, now: time.Now}
 }
 
 // RunOnce handles the tasks that are waiting_callback past their deadline. For
 // each it asks the supplier, through provider-svc QueryOrder, whether the
-// invoice was issued. A found result advances the task as the callback would
-// have. If the supplier has no such order, the task is marked failed and a new
-// pending task with no supplier is created for the same command, with a
-// "task created" outbox event, so provider-svc picks the next supplier.
+// invoice was issued. A found result must be applied through
+// Events.ApplyOutcome, so the task move, the invoice move, invoice_no and the
+// issued event commit in one transaction exactly as a callback's would. If
+// the supplier has no such order, the task is marked failed and a new pending
+// task with no supplier is created for the same command, with a "task
+// created" outbox event, so provider-svc picks the next supplier.
 //
 // Invariant: an order the supplier has already issued is never reordered, and a
 // timed-out order the supplier does not know is retried exactly once per

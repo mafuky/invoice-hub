@@ -21,6 +21,12 @@ type DBTX interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// state_log.entity values.
+const (
+	EntityInvoice = "invoice"
+	EntityTask    = "task"
+)
+
 type Repo struct {
 	db *sql.DB
 }
@@ -63,7 +69,16 @@ func (r *Repo) GetInvoice(ctx context.Context, id int64) (domain.Invoice, error)
 }
 
 func (r *Repo) GetInvoiceTx(ctx context.Context, q DBTX, id int64) (domain.Invoice, error) {
-	inv, err := scanInvoice(q.QueryRowContext(ctx, `SELECT `+invoiceCols+` FROM invoices WHERE id = ?`, id))
+	return r.getInvoice(ctx, q, id, "")
+}
+
+// GetInvoiceForUpdate reads the invoice and locks its row until tx ends.
+func (r *Repo) GetInvoiceForUpdate(ctx context.Context, tx *sql.Tx, id int64) (domain.Invoice, error) {
+	return r.getInvoice(ctx, tx, id, " FOR UPDATE")
+}
+
+func (r *Repo) getInvoice(ctx context.Context, q DBTX, id int64, lock string) (domain.Invoice, error) {
+	inv, err := scanInvoice(q.QueryRowContext(ctx, `SELECT `+invoiceCols+` FROM invoices WHERE id = ?`+lock, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Invoice{}, fmt.Errorf("invoice %d: %w", id, domain.ErrNotFound)
 	}
@@ -178,7 +193,16 @@ func scanTask(row rowScanner) (domain.Task, error) {
 }
 
 func (r *Repo) GetTask(ctx context.Context, q DBTX, id int64) (domain.Task, error) {
-	t, err := scanTask(q.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id = ?`, id))
+	return r.getTask(ctx, q, id, "")
+}
+
+// GetTaskForUpdate reads the task and locks its row until tx ends.
+func (r *Repo) GetTaskForUpdate(ctx context.Context, tx *sql.Tx, id int64) (domain.Task, error) {
+	return r.getTask(ctx, tx, id, " FOR UPDATE")
+}
+
+func (r *Repo) getTask(ctx context.Context, q DBTX, id int64, lock string) (domain.Task, error) {
+	t, err := scanTask(q.QueryRowContext(ctx, `SELECT `+taskCols+` FROM tasks WHERE id = ?`+lock, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Task{}, fmt.Errorf("task %d: %w", id, domain.ErrNotFound)
 	}
@@ -227,4 +251,22 @@ func (r *Repo) ListTimedOutTasks(ctx context.Context, now time.Time, limit int) 
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// GetCommand loads one command; it returns domain.ErrNotFound when the id is unknown.
+func (r *Repo) GetCommand(ctx context.Context, q DBTX, id int64) (domain.Command, error) {
+	var (
+		c      domain.Command
+		status string
+	)
+	err := q.QueryRowContext(ctx, `SELECT id, invoice_id, kind, status, reason FROM commands WHERE id = ?`, id).
+		Scan(&c.ID, &c.InvoiceID, &c.Kind, &status, &c.Reason)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domain.Command{}, fmt.Errorf("command %d: %w", id, domain.ErrNotFound)
+	}
+	if err != nil {
+		return domain.Command{}, fmt.Errorf("store: get command %d: %w", id, err)
+	}
+	c.Status = domain.CommandStatus(status)
+	return c, nil
 }

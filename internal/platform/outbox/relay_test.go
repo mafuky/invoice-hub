@@ -4,10 +4,13 @@ package outbox
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+
+	amqp "github.com/rabbitmq/amqp091-go"
 
 	"github.com/mafuky/invoice-hub/internal/platform/event"
 	"github.com/mafuky/invoice-hub/internal/platform/testenv"
@@ -143,5 +146,44 @@ func TestRelay_BrokerNack_RowStaysNewWithLaterAttempt(t *testing.T) {
 	}
 	if status != "new" || attempts != 1 || !later {
 		t.Fatalf("after a nack: status=%s attempts=%d next_attempt_at_in_future=%v", status, attempts, later)
+	}
+}
+
+type closedPublisher struct{}
+
+func (closedPublisher) Publish(context.Context, string, event.Envelope) error {
+	return fmt.Errorf("mq: publish invoice.task.created: %w", amqp.ErrClosed)
+}
+
+func TestRelay_PublisherChannelClosed_AbortsPassWithoutMarkingFailure(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "invoice")
+
+	env, err := event.New("invoice.task.created", "1", 0, map[string]int{"task_id": 1}, "trace-relay")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := Insert(ctx, tx, "invoice.task.created", env); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = NewRelay(db, closedPublisher{}, "closed").RunOnce(ctx)
+	if !errors.Is(err, amqp.ErrClosed) {
+		t.Fatalf("RunOnce error = %v, want one wrapping amqp.ErrClosed", err)
+	}
+	var status string
+	var attempts int
+	if err := db.QueryRowContext(ctx, `SELECT status, attempts FROM outbox WHERE event_id = ?`, env.EventID).Scan(&status, &attempts); err != nil {
+		t.Fatal(err)
+	}
+	if status != "new" || attempts != 0 {
+		t.Fatalf("after a closed channel: status=%s attempts=%d, want new and 0", status, attempts)
 	}
 }

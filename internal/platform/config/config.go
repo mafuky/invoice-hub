@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 type Config struct {
@@ -37,6 +38,9 @@ type Config struct {
 
 	MockURL         string
 	MockCallbackURL string
+
+	// CallbackDeadline is how long invoice-svc waits for a supplier callback before querying the order.
+	CallbackDeadline time.Duration
 }
 
 var keyRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
@@ -44,6 +48,8 @@ var keyRe = regexp.MustCompile(`^[A-Z0-9_]+$`)
 const (
 	defaultMockAddr        = ":8090"
 	defaultMockCallbackURL = "http://127.0.0.1:8080/callbacks"
+
+	defaultCallbackDeadline = 2 * time.Minute
 )
 
 // source resolves keys from the process environment, then the .env file.
@@ -139,6 +145,14 @@ func Load() (Config, error) {
 	}
 	if len(src.missing) > 0 {
 		return Config{}, fmt.Errorf("config: missing required keys: %s", strings.Join(src.missing, ", "))
+	}
+	c.CallbackDeadline = defaultCallbackDeadline
+	if v := get("INVHUB_CALLBACK_DEADLINE", "", false); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			return Config{}, errors.New("config: INVHUB_CALLBACK_DEADLINE must be a positive duration such as 2m")
+		}
+		c.CallbackDeadline = d
 	}
 	return c, nil
 }
@@ -239,6 +253,7 @@ func (c Config) redacted() []slog.Attr {
 		slog.String("mock_addr", c.MockAddr),
 		slog.String("mock_url", c.MockURL),
 		slog.String("mock_callback_url", c.MockCallbackURL),
+		slog.String("callback_deadline", c.CallbackDeadline.String()),
 	}
 }
 

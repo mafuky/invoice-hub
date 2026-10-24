@@ -35,10 +35,9 @@ import (
 )
 
 const (
-	consumePrefetch     = 16
-	scanInterval        = 5 * time.Second
-	shutdownGrace       = 10 * time.Second
-	defaultCallbackWait = 2 * time.Minute
+	consumePrefetch = 16
+	scanInterval    = 5 * time.Second
+	shutdownGrace   = 10 * time.Second
 )
 
 func main() {
@@ -62,11 +61,6 @@ func run(mode string, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	callbackWait, err := callbackDeadline()
-	if err != nil {
-		return err
-	}
-
 	db, err := platformstore.OpenMySQL(ctx, cfg.MySQLDSNInvoice)
 	if err != nil {
 		return err
@@ -87,7 +81,7 @@ func run(mode string, log *slog.Logger) error {
 	log.Info("queues declared")
 
 	repo := store.NewRepo(db)
-	events := app.NewEvents(db, repo, callbackWait)
+	events := app.NewEvents(db, repo, cfg.CallbackDeadline)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -109,7 +103,7 @@ func run(mode string, log *slog.Logger) error {
 		log.Info("listening " + cfg.InvoiceAddr)
 		loops.start("grpc", func() error { return gs.Serve(lis) })
 
-		scanner := app.NewScanner(db, repo, providerv1.NewProviderServiceClient(providerConn))
+		scanner := app.NewScanner(db, repo, providerv1.NewProviderServiceClient(providerConn), events)
 		loops.start("timeout scanner", func() error { return scanner.Run(runCtx, scanInterval) })
 	}
 	if mode == "serve" || mode == "consume-only" {
@@ -136,16 +130,18 @@ func run(mode string, log *slog.Logger) error {
 	}
 
 	cancel()
+	grace, graceCancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer graceCancel()
 	if gs != nil {
 		stopped := make(chan struct{})
 		go func() { gs.GracefulStop(); close(stopped) }()
 		select {
 		case <-stopped:
-		case <-time.After(shutdownGrace):
+		case <-grace.Done():
 			gs.Stop()
 		}
 	}
-	if !loops.wait(shutdownGrace) {
+	if !loops.wait(grace) {
 		log.Warn("loops did not stop within the grace period")
 	}
 	return runErr
@@ -176,27 +172,15 @@ func (g *loopGroup) start(name string, fn func() error) {
 	}()
 }
 
-func (g *loopGroup) wait(d time.Duration) bool {
+func (g *loopGroup) wait(ctx context.Context) bool {
 	done := make(chan struct{})
 	go func() { g.wg.Wait(); close(done) }()
 	select {
 	case <-done:
 		return true
-	case <-time.After(d):
+	case <-ctx.Done():
 		return false
 	}
-}
-
-func callbackDeadline() (time.Duration, error) {
-	v := os.Getenv("INVHUB_CALLBACK_DEADLINE")
-	if v == "" {
-		return defaultCallbackWait, nil
-	}
-	d, err := time.ParseDuration(v)
-	if err != nil || d <= 0 {
-		return 0, errors.New("INVHUB_CALLBACK_DEADLINE must be a positive duration such as 2m")
-	}
-	return d, nil
 }
 
 // dialAMQP checks the broker is reachable first so a closed tunnel fails fast

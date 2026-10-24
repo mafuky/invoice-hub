@@ -2,6 +2,7 @@ package invoicegrpc_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -55,15 +56,31 @@ func (f *fakeRepo) ListInvoices(_ context.Context, status string, after int64, l
 	return out, nil
 }
 
-// traceCommands records the trace id it sees and otherwise behaves like an unfinished lesson.
-type traceCommands struct {
-	*app.Service
-	trace string
+// fakeCommands stands in for the use cases; every command fails like an
+// unfinished lesson unless a test overrides it.
+type fakeCommands struct {
+	trace   string
+	panicOn bool
 }
 
-func (c *traceCommands) Apply(ctx context.Context, in app.ApplyInput) (int64, bool, error) {
+func (c *fakeCommands) Apply(ctx context.Context, _ app.ApplyInput) (int64, bool, error) {
 	c.trace = logx.TraceID(ctx)
-	return c.Service.Apply(ctx, in)
+	if c.panicOn {
+		panic("apply blew up")
+	}
+	return 0, false, fmt.Errorf("lesson 2: %w", errors.ErrUnsupported)
+}
+
+func (c *fakeCommands) RedFlush(context.Context, int64, string) (int64, error) {
+	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
+}
+
+func (c *fakeCommands) Reissue(context.Context, int64, string) (int64, error) {
+	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
+}
+
+func (c *fakeCommands) Supplement(context.Context, app.ApplyInput) (int64, int64, error) {
+	return 0, 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
 
 func start(t *testing.T, cmds invoicegrpc.Commands, repo invoicegrpc.Reader) invoicev1.InvoiceServiceClient {
@@ -95,7 +112,7 @@ func applyRequest() *invoicev1.ApplyRequest {
 }
 
 func TestGRPC_ApplyReturnsUnimplementedUntilLesson2(t *testing.T) {
-	cmds := &traceCommands{Service: app.NewService(nil, nil)}
+	cmds := &fakeCommands{}
 	client := start(t, cmds, &fakeRepo{})
 
 	ctx := metadata.AppendToOutgoingContext(context.Background(), "x-trace-id", "trace-apply-0001")
@@ -113,7 +130,7 @@ func TestGRPC_ApplyReturnsUnimplementedUntilLesson2(t *testing.T) {
 }
 
 func TestGRPC_RedFlushReturnsUnimplementedUntilLesson9(t *testing.T) {
-	client := start(t, app.NewService(nil, nil), &fakeRepo{})
+	client := start(t, &fakeCommands{}, &fakeRepo{})
 	_, err := client.RedFlush(context.Background(), &invoicev1.RedFlushRequest{InvoiceId: 1, Reason: "ticket refunded"})
 	st, _ := status.FromError(err)
 	if st.Code() != codes.Unimplemented || !strings.Contains(st.Message(), "lesson 9") {
@@ -122,7 +139,7 @@ func TestGRPC_RedFlushReturnsUnimplementedUntilLesson9(t *testing.T) {
 }
 
 func TestGRPC_ApplyRejectsMalformedAmount(t *testing.T) {
-	client := start(t, app.NewService(nil, nil), &fakeRepo{})
+	client := start(t, &fakeCommands{}, &fakeRepo{})
 	req := applyRequest()
 	req.Amount = "19.99.9"
 	_, err := client.Apply(context.Background(), req)
@@ -132,7 +149,7 @@ func TestGRPC_ApplyRejectsMalformedAmount(t *testing.T) {
 }
 
 func TestGRPC_GetUnknownInvoice_NotFound(t *testing.T) {
-	client := start(t, app.NewService(nil, nil), &fakeRepo{})
+	client := start(t, &fakeCommands{}, &fakeRepo{})
 	_, err := client.Get(context.Background(), &invoicev1.GetRequest{InvoiceId: 999})
 	if status.Code(err) != codes.NotFound {
 		t.Fatalf("code = %v, want NotFound (err: %v)", status.Code(err), err)
@@ -153,7 +170,7 @@ func seeded(n int) *fakeRepo {
 }
 
 func TestGRPC_Get_ReturnsAmountWithTwoDecimals(t *testing.T) {
-	client := start(t, app.NewService(nil, nil), seeded(3))
+	client := start(t, &fakeCommands{}, seeded(3))
 	inv, err := client.Get(context.Background(), &invoicev1.GetRequest{InvoiceId: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -165,7 +182,7 @@ func TestGRPC_Get_ReturnsAmountWithTwoDecimals(t *testing.T) {
 
 func TestGRPC_List_PagesWithOpaqueToken(t *testing.T) {
 	repo := seeded(5)
-	client := start(t, app.NewService(nil, nil), repo)
+	client := start(t, &fakeCommands{}, repo)
 
 	first, err := client.List(context.Background(), &invoicev1.ListRequest{PageSize: 2})
 	if err != nil {
@@ -192,7 +209,7 @@ func TestGRPC_List_PagesWithOpaqueToken(t *testing.T) {
 
 func TestGRPC_List_PageSizeDefaultsAndCaps(t *testing.T) {
 	repo := seeded(1)
-	client := start(t, app.NewService(nil, nil), repo)
+	client := start(t, &fakeCommands{}, repo)
 	for _, c := range []struct {
 		ask  int32
 		want int
@@ -207,11 +224,22 @@ func TestGRPC_List_PageSizeDefaultsAndCaps(t *testing.T) {
 }
 
 func TestGRPC_List_BadTokenAndUnknownStatus_InvalidArgument(t *testing.T) {
-	client := start(t, app.NewService(nil, nil), seeded(1))
+	client := start(t, &fakeCommands{}, seeded(1))
 	if _, err := client.List(context.Background(), &invoicev1.ListRequest{PageToken: "!!not-a-token"}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("bad token: %v", err)
 	}
 	if _, err := client.List(context.Background(), &invoicev1.ListRequest{Status: "paid"}); status.Code(err) != codes.InvalidArgument {
 		t.Errorf("unknown status: %v", err)
+	}
+}
+
+func TestGRPC_HandlerPanic_ReturnsInternalAndServiceKeepsServing(t *testing.T) {
+	client := start(t, &fakeCommands{panicOn: true}, seeded(1))
+	_, err := client.Apply(context.Background(), applyRequest())
+	if status.Code(err) != codes.Internal {
+		t.Fatalf("code = %v, want Internal", status.Code(err))
+	}
+	if _, err := client.Get(context.Background(), &invoicev1.GetRequest{InvoiceId: 1}); err != nil {
+		t.Fatalf("service stopped answering after a panic: %v", err)
 	}
 }

@@ -17,8 +17,9 @@ import (
 // version; nothing was changed.
 //
 // Invariant: the move happens only if the transition table allows it and the
-// invoice is still in state from at the given version; the status change and
-// its state_log row are written together or not at all.
+// invoice is still in state from at the given version; an applied move sets
+// version = version + 1 and writes exactly one state_log row (entity
+// EntityInvoice), and the two are written together or not at all.
 //
 // A stale event that overwrites a newer state sends an invoice backwards, so
 // a delivered invoice is delivered to the customer a second time or an issued
@@ -30,8 +31,9 @@ func (r *Repo) TransitionInvoice(ctx context.Context, tx *sql.Tx, id int64, from
 // TransitionTask moves task id from one execution state to another inside tx,
 // with the same guarantees as TransitionInvoice.
 //
-// Invariant: a task that already reached done or failed is never moved again,
-// and every accepted move leaves one state_log row.
+// Invariant: a task that already reached done or failed is never moved again;
+// an applied move sets version = version + 1 and writes exactly one state_log
+// row (entity EntityTask).
 //
 // A late "failed" callback that overwrites a done task makes the system
 // reopen an order the supplier has already invoiced, and the enterprise pays
