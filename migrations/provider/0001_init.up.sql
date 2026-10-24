@@ -8,7 +8,7 @@ CREATE TABLE provider_orders (
   outcome            VARCHAR(24) NOT NULL DEFAULT '',
   invoice_no         VARCHAR(64) COLLATE utf8mb4_bin NULL,
   version            INT         NOT NULL DEFAULT 0,
-  last_event_seq     INT         NOT NULL DEFAULT 0,
+  last_event_seq     BIGINT      NOT NULL DEFAULT 0,
   created_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
   updated_at         DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
   UNIQUE KEY uk_provider_orders_task (task_id),

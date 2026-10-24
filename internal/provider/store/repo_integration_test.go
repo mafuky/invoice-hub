@@ -25,7 +25,7 @@ func TestApplyOutcome_OnlyNewerEventSeqApplies(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	apply := func(version, seq int, status string) bool {
+	apply := func(version int, seq int64, status string) bool {
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
 			t.Fatal(err)

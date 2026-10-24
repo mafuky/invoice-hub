@@ -40,7 +40,7 @@ type Order struct {
 	InvoiceNo       string
 	Version         int
 	// LastEventSeq is the highest supplier event_seq applied to the order.
-	LastEventSeq int
+	LastEventSeq int64
 }
 
 // NewOrder is a supplier order the supplier has just accepted.
@@ -155,16 +155,16 @@ func (r *Repo) ExcludedSuppliers(ctx context.Context, q DBTX, invoiceID, taskID 
 
 // ApplyOutcome moves an order to status for the supplier event seq. It applies
 // only while the order is still at version and has seen no event with a
-// sequence of seq or higher; applied=false means another callback got there first.
-func (r *Repo) ApplyOutcome(ctx context.Context, tx *sql.Tx, orderID int64, version, seq int, status, outcome, invoiceNo string) (applied bool, err error) {
+// sequence of seq or higher and has not succeeded; applied=false means another callback got there first.
+func (r *Repo) ApplyOutcome(ctx context.Context, tx *sql.Tx, orderID int64, version int, seq int64, status, outcome, invoiceNo string) (applied bool, err error) {
 	var inv any
 	if invoiceNo != "" {
 		inv = invoiceNo
 	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE provider_orders SET status = ?, outcome = ?, invoice_no = ?, last_event_seq = ?, version = version + 1
-		 WHERE id = ? AND version = ? AND last_event_seq < ?`,
-		status, outcome, inv, seq, orderID, version, seq)
+		 WHERE id = ? AND version = ? AND last_event_seq < ? AND status <> ?`,
+		status, outcome, inv, seq, orderID, version, seq, StatusSucceeded)
 	if err != nil {
 		return false, fmt.Errorf("update provider order %d: %w", orderID, err)
 	}
