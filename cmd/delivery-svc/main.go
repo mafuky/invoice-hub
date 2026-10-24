@@ -65,6 +65,9 @@ func run(log *slog.Logger) error {
 		return err
 	}
 	defer func() { _ = mongoDB.Client().Disconnect(context.Background()) }()
+	if err := store.RequireTransactions(ctx, mongoDB); err != nil {
+		return err
+	}
 	if err := platformstore.EnsureMongoIndexes(ctx, mongoDB); err != nil {
 		return err
 	}

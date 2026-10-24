@@ -19,6 +19,7 @@ type Scanner struct {
 	now  func() time.Time
 }
 
+// NewScanner scans the deliveries kept in repo.
 func NewScanner(repo *store.Repo) *Scanner { return &Scanner{repo: repo, now: time.Now} }
 
 // RecoverStuck puts back to pending every delivery that has been delivering

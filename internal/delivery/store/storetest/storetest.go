@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 
 	"github.com/mafuky/invoice-hub/internal/delivery/store"
@@ -20,7 +19,7 @@ import (
 	platformstore "github.com/mafuky/invoice-hub/internal/platform/store"
 )
 
-var collections = []string{"deliveries", "outbox", "processed_events", "callbacks"}
+var collections = []string{"deliveries", "outbox", "processed_events", "delivery_invoices", "callbacks"}
 
 // Open connects to the configured MongoDB and returns the database with a
 // fresh collection prefix whose indexes are created. It skips the test when
@@ -59,15 +58,8 @@ func NewRepo(t *testing.T) *store.Repo {
 	db, prefix := Open(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	var hello struct {
-		SetName string `bson:"setName"`
-		Msg     string `bson:"msg"`
-	}
-	if err := db.RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err != nil {
-		t.Skipf("cannot query mongo topology: %v", err)
-	}
-	if hello.SetName == "" && hello.Msg != "isdbgrid" {
-		t.Skip("mongo is not a replica set, so it cannot run transactions")
+	if err := store.RequireTransactions(ctx, db); err != nil {
+		t.Skip(err)
 	}
 	return store.NewRepoWithPrefix(db, prefix)
 }

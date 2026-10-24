@@ -40,7 +40,7 @@ func queue(t *testing.T, repo *store.Repo, n int) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := repo.InsertOutbox(context.Background(), mq.DeliverySucceeded, env); err != nil {
+		if err := repo.InsertOutbox(context.Background(), mq.DeliverySucceeded, env, ""); err != nil {
 			t.Fatal(err)
 		}
 	}

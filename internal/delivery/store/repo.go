@@ -34,6 +34,27 @@ var Channels = []string{ChannelCustomer, ChannelFinance}
 
 var ErrNotFound = errors.New("delivery not found")
 
+// ErrClaimLost means the delivery is no longer held by the caller: it was
+// taken back and possibly claimed by another worker since the caller claimed it.
+var ErrClaimLost = errors.New("delivery claim lost")
+
+// Outcome is how a channel ended for an invoice version.
+type Outcome string
+
+const (
+	OutcomeDelivered Outcome = "delivered"
+	OutcomeGaveUp    Outcome = "gave_up"
+)
+
+// DeliveredKey and GaveUpKey are the outbox dedupe keys of the two announcements.
+func DeliveredKey(invoiceID int64, version int) string {
+	return fmt.Sprintf("delivered:%d:%d", invoiceID, version)
+}
+
+func GaveUpKey(invoiceID int64, version int) string {
+	return fmt.Sprintf("gave_up:%d:%d", invoiceID, version)
+}
+
 // Delivery is one invoice version on its way to one channel.
 type Delivery struct {
 	ID             bson.ObjectID `bson:"_id"`
@@ -72,6 +93,7 @@ type Repo struct {
 	deliveries *mongo.Collection
 	outbox     *mongo.Collection
 	processed  *mongo.Collection
+	invoices   *mongo.Collection
 }
 
 // NewRepo uses the deliveries, outbox and processed_events collections of db.
@@ -84,6 +106,7 @@ func NewRepoWithPrefix(db *mongo.Database, prefix string) *Repo {
 		deliveries: db.Collection(prefix + "deliveries"),
 		outbox:     db.Collection(prefix + "outbox"),
 		processed:  db.Collection(prefix + "processed_events"),
+		invoices:   db.Collection(prefix + "delivery_invoices"),
 	}
 }
 
@@ -98,7 +121,8 @@ func (r *Repo) ProcessedEvents() *mongo.Collection { return r.processed }
 
 // WithTx runs fn in one MongoDB transaction. Repo calls made with the context
 // fn receives commit or roll back together; an error from fn rolls everything back.
-// Transactions need a replica set.
+// Transactions need a replica set. fn may run more than once (transient errors
+// and write conflicts are retried); do only database work in it, never send pushes.
 func (r *Repo) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
 	sess, err := r.db.Client().StartSession()
 	if err != nil {
@@ -196,26 +220,30 @@ func (r *Repo) list(ctx context.Context, filter, sort bson.D, limit int) ([]Deli
 }
 
 // MarkDelivering moves a pending delivery to delivering and reports claimed=false
-// when another worker got it first.
-func (r *Repo) MarkDelivering(ctx context.Context, id bson.ObjectID, now time.Time) (claimed bool, err error) {
-	return r.update(ctx, bson.D{{Key: "_id", Value: id}, {Key: "status", Value: StatusPending}}, bson.D{
+// when another worker got it first. since is the claim's token: the later
+// transitions only apply while the record still carries it.
+func (r *Repo) MarkDelivering(ctx context.Context, id bson.ObjectID, now time.Time) (claimed bool, since time.Time, err error) {
+	since = now.UTC().Truncate(time.Millisecond)
+	claimed, err = r.update(ctx, bson.D{{Key: "_id", Value: id}, {Key: "status", Value: StatusPending}}, bson.D{
 		{Key: "status", Value: StatusDelivering},
-		{Key: "delivering_since", Value: now},
+		{Key: "delivering_since", Value: since},
 	})
+	return claimed, since, err
 }
 
-// MarkDelivered moves a delivering delivery to delivered.
-func (r *Repo) MarkDelivered(ctx context.Context, id bson.ObjectID, now time.Time) (changed bool, err error) {
-	return r.update(ctx, bson.D{{Key: "_id", Value: id}, {Key: "status", Value: StatusDelivering}}, bson.D{
+// MarkDelivered moves a delivery claimed at since to delivered, or returns ErrClaimLost.
+func (r *Repo) MarkDelivered(ctx context.Context, id bson.ObjectID, since, now time.Time) error {
+	return r.fenced(ctx, id, since, bson.D{
 		{Key: "status", Value: StatusDelivered},
 		{Key: "delivered_at", Value: now},
 		{Key: "delivering_since", Value: nil},
 	})
 }
 
-// MarkRetry puts a delivering delivery back to pending, due at next, with the attempt count so far.
-func (r *Repo) MarkRetry(ctx context.Context, id bson.ObjectID, attempt int, next time.Time, lastErr string) (changed bool, err error) {
-	return r.update(ctx, bson.D{{Key: "_id", Value: id}, {Key: "status", Value: StatusDelivering}}, bson.D{
+// MarkRetry puts a delivery claimed at since back to pending, due at next, with
+// the attempt count so far, or returns ErrClaimLost.
+func (r *Repo) MarkRetry(ctx context.Context, id bson.ObjectID, since time.Time, attempt int, next time.Time, lastErr string) error {
+	return r.fenced(ctx, id, since, bson.D{
 		{Key: "status", Value: StatusPending},
 		{Key: "attempt", Value: attempt},
 		{Key: "next_retry_at", Value: next},
@@ -224,14 +252,29 @@ func (r *Repo) MarkRetry(ctx context.Context, id bson.ObjectID, attempt int, nex
 	})
 }
 
-// MarkGaveUp ends a delivering delivery without success.
-func (r *Repo) MarkGaveUp(ctx context.Context, id bson.ObjectID, attempt int, lastErr string) (changed bool, err error) {
-	return r.update(ctx, bson.D{{Key: "_id", Value: id}, {Key: "status", Value: StatusDelivering}}, bson.D{
+// MarkGaveUp ends a delivery claimed at since without success, or returns ErrClaimLost.
+func (r *Repo) MarkGaveUp(ctx context.Context, id bson.ObjectID, since time.Time, attempt int, lastErr string) error {
+	return r.fenced(ctx, id, since, bson.D{
 		{Key: "status", Value: StatusGaveUp},
 		{Key: "attempt", Value: attempt},
 		{Key: "last_error", Value: lastErr},
 		{Key: "delivering_since", Value: nil},
 	})
+}
+
+func (r *Repo) fenced(ctx context.Context, id bson.ObjectID, since time.Time, set bson.D) error {
+	ok, err := r.update(ctx, bson.D{
+		{Key: "_id", Value: id},
+		{Key: "status", Value: StatusDelivering},
+		{Key: "delivering_since", Value: since.UTC().Truncate(time.Millisecond)},
+	}, set)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrClaimLost
+	}
+	return nil
 }
 
 // Requeue puts a delivery back to pending, due now, only if it is still
@@ -270,9 +313,73 @@ func (r *Repo) CountByStatus(ctx context.Context, invoiceID int64, version int, 
 	return n, nil
 }
 
-// InsertOutbox queues env for the relay. Inside WithTx it commits with the delivery rows.
-func (r *Repo) InsertOutbox(ctx context.Context, routingKey string, env event.Envelope) error {
-	return outbox.Insert(ctx, r.outbox, routingKey, env)
+// InsertOutbox queues env for the relay. Inside WithTx it commits with the
+// delivery rows. A non-empty dedupeKey makes a second row with the same key fail.
+func (r *Repo) InsertOutbox(ctx context.Context, routingKey string, env event.Envelope, dedupeKey string) error {
+	return outbox.Insert(ctx, r.outbox, routingKey, env, dedupeKey)
+}
+
+// RecordChannelOutcome notes that a channel of an invoice version ended and
+// reports which announcements the caller must now write to the outbox.
+// It must run inside the delivery transaction, and it goes through one summary
+// document per invoice version because counting the separate channel documents
+// under snapshot isolation can miss the last channel; the shared document makes
+// concurrent transactions conflict, and the loser is retried.
+func (r *Repo) RecordChannelOutcome(sessCtx context.Context, invoiceID int64, version int, channel string, outcome Outcome) (announceDelivered, announceGaveUp bool, err error) {
+	id := bson.D{{Key: "invoice_id", Value: invoiceID}, {Key: "version", Value: version}}
+	field := "delivered"
+	if outcome == OutcomeGaveUp {
+		field = "gave_up"
+	}
+	_, err = r.invoices.UpdateOne(sessCtx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		{Key: "$addToSet", Value: bson.D{{Key: field, Value: channel}}},
+		{Key: "$setOnInsert", Value: bson.D{
+			{Key: "delivered_announced", Value: false},
+			{Key: "gave_up_announced", Value: false},
+		}},
+	}, options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		return false, false, fmt.Errorf("store: record %s of invoice %d v%d on %s: %w", outcome, invoiceID, version, channel, err)
+	}
+
+	switch outcome {
+	case OutcomeDelivered:
+		res, err := r.invoices.UpdateOne(sessCtx, bson.D{
+			{Key: "_id", Value: id},
+			{Key: "delivered_announced", Value: false},
+			{Key: "delivered", Value: bson.D{{Key: "$all", Value: Channels}}},
+		}, bson.D{{Key: "$set", Value: bson.D{{Key: "delivered_announced", Value: true}}}})
+		if err != nil {
+			return false, false, fmt.Errorf("store: announce delivered of invoice %d v%d: %w", invoiceID, version, err)
+		}
+		return res.ModifiedCount == 1, false, nil
+	case OutcomeGaveUp:
+		res, err := r.invoices.UpdateOne(sessCtx, bson.D{
+			{Key: "_id", Value: id},
+			{Key: "gave_up_announced", Value: false},
+		}, bson.D{{Key: "$set", Value: bson.D{{Key: "gave_up_announced", Value: true}}}})
+		if err != nil {
+			return false, false, fmt.Errorf("store: announce gave up of invoice %d v%d: %w", invoiceID, version, err)
+		}
+		return false, res.ModifiedCount == 1, nil
+	}
+	return false, false, fmt.Errorf("store: unknown outcome %q", outcome)
+}
+
+// RequireTransactions fails unless db runs on a replica set or a sharded
+// cluster, the only deployments where MongoDB transactions work.
+func RequireTransactions(ctx context.Context, db *mongo.Database) error {
+	var hello struct {
+		SetName string `bson:"setName"`
+		Msg     string `bson:"msg"`
+	}
+	if err := db.RunCommand(ctx, bson.D{{Key: "hello", Value: 1}}).Decode(&hello); err != nil {
+		return fmt.Errorf("store: cannot query mongo topology: %w", err)
+	}
+	if hello.SetName == "" && hello.Msg != "isdbgrid" {
+		return errors.New("store: mongo is not a replica set; delivery-svc needs transactions, so start mongod with --replSet and run rs.initiate()")
+	}
+	return nil
 }
 
 // MarkProcessed records an event id and reports first=false when it was seen before.

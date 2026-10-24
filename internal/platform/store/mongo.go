@@ -66,10 +66,16 @@ func ensureIndexes(ctx context.Context, db *mongo.Database, prefix string) error
 		{"deliveries", []mongo.IndexModel{
 			uniq("uk_deliveries_invoice_channel_version", bson.D{{Key: "invoice_id", Value: 1}, {Key: "channel", Value: 1}, {Key: "invoice_version", Value: 1}}),
 			plain("idx_deliveries_status_retry", bson.D{{Key: "status", Value: 1}, {Key: "next_retry_at", Value: 1}}),
+			plain("idx_deliveries_status_since", bson.D{{Key: "status", Value: 1}, {Key: "delivering_since", Value: 1}}),
 		}},
 		{"outbox", []mongo.IndexModel{
 			uniq("uk_outbox_event", bson.D{{Key: "event_id", Value: 1}}),
 			plain("idx_outbox_status_next", bson.D{{Key: "status", Value: 1}, {Key: "next_attempt_at", Value: 1}}),
+			{
+				Keys: bson.D{{Key: "dedupe_key", Value: 1}},
+				Options: options.Index().SetName("uk_outbox_dedupe_key").SetUnique(true).
+					SetPartialFilterExpression(bson.D{{Key: "dedupe_key", Value: bson.D{{Key: "$type", Value: "string"}}}}),
+			},
 		}},
 		{"processed_events", []mongo.IndexModel{
 			uniq("uk_processed_events_event", bson.D{{Key: "event_id", Value: 1}}),

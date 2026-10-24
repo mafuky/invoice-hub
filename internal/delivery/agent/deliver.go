@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	// MaxAttempts is how many failed pushes a channel gets before delivery gives up on the invoice.
+	// MaxAttempts is the number of failed pushes after which delivery gives up on a channel.
 	MaxAttempts = 8
 	// RetryBase and RetryMax bound the wait before a failed push is tried again.
 	RetryBase = 5 * time.Second
@@ -33,7 +33,8 @@ type DeliveryAgent struct {
 	repo    *store.Repo
 	senders map[string]Sender
 	now     func() time.Time
-	rnd     *rand.Rand
+	// rnd is not safe for concurrent use; one goroutine delivers at a time.
+	rnd *rand.Rand
 }
 
 // NewDeliveryAgent sends each channel's deliveries through senders[channel].
@@ -49,9 +50,9 @@ func NewDeliveryAgent(repo *store.Repo, senders map[string]Sender) *DeliveryAgen
 // NextRetry is the wait before a failed push of an invoice is tried again,
 // where attempt counts the failed pushes so far, starting at 1.
 //
-// Invariant: the wait never shrinks as attempts pile up, never exceeds max,
-// and differs between deliveries that failed together; the same random source
-// gives the same waits.
+// Invariant: the wait grows with attempts until it reaches max, never exceeds
+// max, and differs between deliveries that failed together; the same random
+// source gives the same waits.
 //
 // If every failed delivery retries at the same instant, a customer endpoint
 // that has just recovered is flooded by all of them at once and goes down
@@ -76,18 +77,21 @@ func (a *DeliveryAgent) OnInvoiceIssued(ctx context.Context, env event.Envelope)
 // Deliver pushes one pending delivery to its channel and records the outcome.
 //
 // Invariant: delivery is at least once: a push is never skipped because an
-// earlier answer was lost, and the delivery record ends up in exactly one of
-// delivered, pending for a later retry, or gave up after MaxAttempts failed
-// pushes. The invoice-delivered event is announced once, only when both
-// channels have delivered, and in the same transaction that records the second
-// channel; the gave-up event is announced once per invoice. A record that
-// another worker already took is left alone.
+// earlier answer was lost. The record ends up in exactly one of delivered,
+// pending with the next attempt time (after which the push error is returned),
+// or gave up after MaxAttempts (8) failed pushes. The invoice-delivered event
+// is announced once, only after both channels have delivered; the gave-up
+// event is announced once per invoice version. Whether to announce is decided
+// by Repo.RecordChannelOutcome, and the outbox row is written only when it says
+// so, in the same transaction that records the outcome. A record that another
+// worker already took, or whose claim was lost (store.ErrClaimLost), is left
+// alone, and that is not an error to retry.
 //
 // If the customer endpoint processed a push but its answer timed out, the push
 // is repeated and the customer receives the invoice twice unless the receiver
 // drops the repeat by invoice id and version; if "delivered" is announced
 // after only one channel succeeded, the invoice is settled although finance
-// never received it.
+// never received it; if "delivered" is never announced, it is never settled.
 func (a *DeliveryAgent) Deliver(ctx context.Context, d store.Delivery) error {
 	return fmt.Errorf("lesson 6: %w", errors.ErrUnsupported)
 }

@@ -5,6 +5,7 @@ package store_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestRepo_WithTxRollsBackBoth(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if err := repo.InsertOutbox(ctx, mq.DeliverySucceeded, env); err != nil {
+		if err := repo.InsertOutbox(ctx, mq.DeliverySucceeded, env, ""); err != nil {
 			return err
 		}
 		return boom
@@ -65,7 +66,7 @@ func TestRepo_WithTxCommitsBoth(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		return repo.InsertOutbox(ctx, mq.DeliverySucceeded, env)
+		return repo.InsertOutbox(ctx, mq.DeliverySucceeded, env, "")
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -106,10 +107,10 @@ func TestRepo_MarkDelivering_OnlyOneWorkerClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now().UTC()
-	if ok, err := repo.MarkDelivering(ctx, d.ID, now); err != nil || !ok {
+	if ok, _, err := repo.MarkDelivering(ctx, d.ID, now); err != nil || !ok {
 		t.Fatalf("first claim: %v %v", ok, err)
 	}
-	if ok, err := repo.MarkDelivering(ctx, d.ID, now); err != nil || ok {
+	if ok, _, err := repo.MarkDelivering(ctx, d.ID, now); err != nil || ok {
 		t.Fatalf("second claim: %v %v, want false", ok, err)
 	}
 }
@@ -122,7 +123,7 @@ func TestRepo_RequeueKeepsRecentDelivering(t *testing.T) {
 	}
 	d, _ := repo.Find(ctx, 7005, 1, store.ChannelCustomer)
 	now := time.Now().UTC()
-	if _, err := repo.MarkDelivering(ctx, d.ID, now); err != nil {
+	if _, _, err := repo.MarkDelivering(ctx, d.ID, now); err != nil {
 		t.Fatal(err)
 	}
 
@@ -135,5 +136,88 @@ func TestRepo_RequeueKeepsRecentDelivering(t *testing.T) {
 	got, _ := repo.Get(ctx, d.ID)
 	if got.Status != store.StatusPending || got.DeliveringSince != nil {
 		t.Fatalf("after requeue: status=%s since=%v", got.Status, got.DeliveringSince)
+	}
+}
+
+func TestRepo_FencedMarkWithOldClaimReturnsClaimLost(t *testing.T) {
+	ctx := context.Background()
+	repo := storetest.NewRepo(t)
+	if _, err := repo.InsertPending(ctx, customerDelivery(7006)); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := repo.Find(ctx, 7006, 1, store.ChannelCustomer)
+	now := time.Now().UTC()
+
+	_, oldSince, err := repo.MarkDelivering(ctx, d.ID, now.Add(-10*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := repo.Requeue(ctx, d.ID, now, now); err != nil || !ok {
+		t.Fatalf("requeue as stale: %v %v", ok, err)
+	}
+	ok, newSince, err := repo.MarkDelivering(ctx, d.ID, now)
+	if err != nil || !ok {
+		t.Fatalf("re-claim: %v %v", ok, err)
+	}
+
+	if err := repo.MarkDelivered(ctx, d.ID, oldSince, now); !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("MarkDelivered with the old claim = %v, want ErrClaimLost", err)
+	}
+	if err := repo.MarkRetry(ctx, d.ID, oldSince, 1, now, "x"); !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("MarkRetry with the old claim = %v, want ErrClaimLost", err)
+	}
+	if err := repo.MarkGaveUp(ctx, d.ID, oldSince, 8, "x"); !errors.Is(err, store.ErrClaimLost) {
+		t.Fatalf("MarkGaveUp with the old claim = %v, want ErrClaimLost", err)
+	}
+	got, err := repo.Get(ctx, d.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != store.StatusDelivering || got.DeliveringSince == nil || !got.DeliveringSince.Equal(newSince) {
+		t.Fatalf("record changed by a lost claim: %+v", got)
+	}
+	if err := repo.MarkDelivered(ctx, d.ID, newSince, now); err != nil {
+		t.Fatalf("MarkDelivered with the current claim: %v", err)
+	}
+}
+
+func TestRepo_RecordChannelOutcome_ConcurrentChannelsAnnounceDeliveredOnce(t *testing.T) {
+	ctx := context.Background()
+	repo := storetest.NewRepo(t)
+
+	for round := 0; round < 5; round++ {
+		invoiceID := int64(7100 + round)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		announced := 0
+		for _, ch := range store.Channels {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				var announce bool // from the attempt that committed; a retried attempt overwrites it
+				err := repo.WithTx(ctx, func(ctx context.Context) error {
+					var gaveUp bool
+					var err error
+					announce, gaveUp, err = repo.RecordChannelOutcome(ctx, invoiceID, 1, ch, store.OutcomeDelivered)
+					if err == nil && gaveUp {
+						t.Errorf("round %d: delivered outcome announced gave up", round)
+					}
+					return err
+				})
+				if err != nil {
+					t.Errorf("round %d channel %s: %v", round, ch, err)
+					return
+				}
+				if announce {
+					mu.Lock()
+					announced++
+					mu.Unlock()
+				}
+			}()
+		}
+		wg.Wait()
+		if announced != 1 {
+			t.Fatalf("round %d: %d transactions announced delivered, want exactly 1", round, announced)
+		}
 	}
 }

@@ -33,13 +33,16 @@ type row struct {
 	NextAttempt time.Time     `bson:"next_attempt_at"`
 	LeaseUntil  time.Time     `bson:"lease_until"`
 	LastError   string        `bson:"last_error,omitempty"`
+	DedupeKey   string        `bson:"dedupe_key,omitempty"`
 	CreatedAt   time.Time     `bson:"created_at"`
 	SentAt      *time.Time    `bson:"sent_at,omitempty"`
 }
 
 // Insert writes env into coll. Called with a transaction context it commits or
 // rolls back together with the delivery records that caused the event.
-func Insert(ctx context.Context, coll *mongo.Collection, routingKey string, env event.Envelope) error {
+// A non-empty dedupeKey is unique across the collection, so the same
+// announcement cannot be queued twice.
+func Insert(ctx context.Context, coll *mongo.Collection, routingKey string, env event.Envelope, dedupeKey string) error {
 	body, err := json.Marshal(env)
 	if err != nil {
 		return fmt.Errorf("outbox: marshal event %s: %w", env.EventID, err)
@@ -49,6 +52,7 @@ func Insert(ctx context.Context, coll *mongo.Collection, routingKey string, env 
 		ID:          bson.NewObjectID(),
 		EventID:     env.EventID,
 		RoutingKey:  routingKey,
+		DedupeKey:   dedupeKey,
 		Body:        string(body),
 		Status:      statusPending,
 		NextAttempt: now,
@@ -110,6 +114,8 @@ func (m mongoRows) markFailed(ctx context.Context, id bson.ObjectID, attempts in
 		{Key: "attempts", Value: attempts},
 		{Key: "next_attempt_at", Value: next},
 		{Key: "last_error", Value: msg},
+		// The claim lease would otherwise outlast the backoff.
+		{Key: "lease_until", Value: time.Now().UTC()},
 	}}})
 	if err != nil {
 		return fmt.Errorf("outbox: mark %s failed: %w", id.Hex(), err)
