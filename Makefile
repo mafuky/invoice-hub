@@ -46,7 +46,7 @@ crash-demo:
 test-integration:
 	go test -p 1 -tags 'lesson integration' ./...
 
-# N -> packages (only the selected lesson test files run).
+# N -> packages (only the selected lesson tests run).
 # 1 -> internal/invoice/domain internal/invoice/store
 # 2 -> internal/invoice/app internal/platform/outbox
 # 3 -> internal/platform/consume internal/platform/mq
@@ -82,8 +82,9 @@ test-lesson:
 	@set -eu; for pkg in $(LESSON_PACKAGES_$(N)); do \
 		set --; \
 		for file in $(LESSON_TESTS_$(N)); do \
-			case "$$file" in "$$pkg/"*) set -- "$$@" "$${file##*/}" ;; esac; \
+			case "$$file" in "$$pkg/"*) set -- "$$@" "$$file" ;; esac; \
 		done; \
-		(cd "$$pkg"; sources=$$(go list -tags 'lesson integration' -f '{{join .GoFiles " "}}' .); \
-			go test -p 1 -tags 'lesson integration' -run . $$sources "$$@"); \
+		tests=$$(sed -n 's/^func \(Test[[:alnum:]_]*\)[[:space:]]*(.*/\1/p' "$$@" | paste -sd '|' -); \
+		test -n "$$tests" || { echo "no lesson tests found for $$pkg" >&2; exit 2; }; \
+		go test -p 1 -count=1 -tags 'lesson integration' -run "^($$tests)$$" "./$$pkg"; \
 	done

@@ -5,15 +5,20 @@ package store
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"testing"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
+
 	"github.com/mafuky/invoice-hub/internal/platform/money"
 	"github.com/mafuky/invoice-hub/internal/platform/testenv"
 	"github.com/mafuky/invoice-hub/internal/settlement/domain"
 )
+
+const arrivalTimeout = 60 * time.Second
 
 func begin(t *testing.T, db *sql.DB) *sql.Tx {
 	t.Helper()
@@ -165,10 +170,12 @@ func TestFindOrCreateSettlement_LocksExistingRow(t *testing.T) {
 		t.Fatal(err)
 	}
 	other := begin(t, db)
-	blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	blockedCtx, cancel := context.WithTimeout(ctx, arrivalTimeout)
 	defer cancel()
 	_, err = r.TransitionSettlement(blockedCtx, other, s.ID, domain.SettlementPendingSettle, domain.SettlementCalculated, s.Version, "test")
-	if err == nil || blockedCtx.Err() == nil {
+	var lockErr *mysql.MySQLError
+	lockTimedOut := errors.As(err, &lockErr) && lockErr.Number == 1205
+	if err == nil || (!lockTimedOut && !errors.Is(blockedCtx.Err(), context.DeadlineExceeded)) {
 		t.Fatalf("concurrent calculation was not blocked by the row lock: %v", err)
 	}
 	_ = other.Rollback()

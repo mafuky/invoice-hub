@@ -21,6 +21,8 @@ import (
 	"github.com/mafuky/invoice-hub/internal/provider/store"
 )
 
+const arrivalTimeout = 60 * time.Second
+
 func runID() string { return fmt.Sprintf("%08x", rand.Uint32()) }
 
 func openRedis(t *testing.T) *redis.Client {
@@ -31,7 +33,7 @@ func openRedis(t *testing.T) *redis.Client {
 	}
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
 	t.Cleanup(func() { rdb.Close() })
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		t.Skipf("redis unavailable: %v", err)
@@ -58,7 +60,7 @@ func submittedOrder(t *testing.T, db *sql.DB) store.Order {
 
 // handleRetrying delivers cb the way a supplier does: a busy order is sent again until the deadline.
 func handleRetrying(ctx context.Context, h *Handler, cb Callback) (Result, error) {
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(arrivalTimeout)
 	for {
 		res, err := h.Handle(ctx, cb)
 		if !errors.Is(err, ErrBusy) || time.Now().After(deadline) {

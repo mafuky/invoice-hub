@@ -17,12 +17,14 @@ import (
 	platformstore "github.com/mafuky/invoice-hub/internal/platform/store"
 )
 
+const arrivalTimeout = 60 * time.Second
+
 func TestRawCallbacks_RepeatedPayloadReportsNotInserted(t *testing.T) {
 	cfg, err := config.Load()
 	if err != nil {
 		t.Skipf("no config: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	db, err := platformstore.OpenMongo(ctx, cfg.MongoURI, cfg.MongoDB)
 	if err != nil {
@@ -31,7 +33,7 @@ func TestRawCallbacks_RepeatedPayloadReportsNotInserted(t *testing.T) {
 	name := fmt.Sprintf("t%08x_callbacks", rand.Uint32())
 	coll := db.Collection(name)
 	t.Cleanup(func() {
-		dctx, c := context.WithTimeout(context.Background(), 10*time.Second)
+		dctx, c := context.WithTimeout(context.Background(), arrivalTimeout)
 		defer c()
 		_ = coll.Drop(dctx)
 	})

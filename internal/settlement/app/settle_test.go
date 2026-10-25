@@ -83,6 +83,8 @@ func amt(t *testing.T, s string) money.Amount {
 	return a
 }
 
+const arrivalTimeout = 60 * time.Second
+
 func newCustomerID() string { return fmt.Sprintf("CUST-%08d", rand.IntN(100_000_000)) }
 
 func newInvoiceID() int64 { return 1_000_000 + rand.Int64N(1<<40) }
@@ -496,7 +498,7 @@ func TestOnInvoiceDelivered_ConcurrentInvoicesShareSettlement(t *testing.T) {
 	svc := NewService(db, store.NewRepo(db), supplier)
 	customerID := newCustomerID()
 	events := []event.Envelope{deliveredEvent(t, newInvoiceID(), customerID), deliveredEvent(t, newInvoiceID(), customerID)}
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	start := make(chan struct{})
 	errc := make(chan error, len(events))

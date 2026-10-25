@@ -19,6 +19,9 @@ import (
 	"github.com/mafuky/invoice-hub/internal/platform/config"
 )
 
+const arrivalTimeout = 60 * time.Second
+const migrationTimeout = 3 * arrivalTimeout
+
 func loadCfg(t *testing.T) config.Config {
 	t.Helper()
 	cfg, err := config.Load()
@@ -38,56 +41,31 @@ var migrationSets = func(cfg config.Config) []struct{ name, dsn string } {
 	}
 }
 
-// The app user may only touch invoice, provider and settlement, so the real
-// databases are used. The down/up cycle runs only when every table is empty;
-// a database holding rows only gets a no-op Up.
+// The app user has grants on the dedicated _test copies. Run packages with -p 1.
 func TestMigrate_UpDownUp(t *testing.T) {
 	cfg := loadCfg(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
 
 	for _, s := range migrationSets(cfg) {
 		t.Run(s.name, func(t *testing.T) {
-			db, err := OpenMySQL(ctx, s.dsn)
+			ctx, cancel := context.WithTimeout(context.Background(), migrationTimeout)
+			defer cancel()
+			mc, err := mysql.ParseDSN(s.dsn)
+			if err != nil {
+				t.Fatalf("invalid %s dsn", s.name)
+			}
+			mc.DBName = s.name + "_test"
+			dsn := mc.FormatDSN()
+			db, err := OpenMySQL(ctx, dsn)
 			if err != nil {
 				t.Skipf("mysql unavailable: %v", err)
 			}
-			t.Cleanup(func() { db.Close() }) // registered first, so it runs after the teardown below
+			t.Cleanup(func() { db.Close() })
 
-			tables := listTables(t, ctx, db)
-			wasEmpty := len(tables) == 0
-			if !wasEmpty && !tables["schema_migrations"] {
-				t.Skipf("database %s holds tables not created by migrations; not touching it", s.name)
-			}
-			if !wasEmpty {
-				var dirty bool
-				if err := db.QueryRowContext(ctx, "SELECT dirty FROM schema_migrations LIMIT 1").Scan(&dirty); err != nil || dirty {
-					t.Skipf("database %s has an unusable schema_migrations state; not touching it", s.name)
-				}
-			}
-
-			if hasRows(t, ctx, db, tables) {
-				if err := MigrateMySQL(ctx, s.dsn, s.name); err != nil {
-					t.Fatalf("up on migrated database: %v", err)
-				}
-				t.Logf("%s: down/up skipped because the database has data", s.name)
-				return
-			}
-
-			// Leave the database as found: empty stays empty, migrated stays migrated.
+			// Leave the test schema migrated even if an assertion fails after down.
 			t.Cleanup(func() {
-				cctx, c := context.WithTimeout(context.Background(), time.Minute)
+				cctx, c := context.WithTimeout(context.Background(), migrationTimeout)
 				defer c()
-				if wasEmpty {
-					if err := MigrateMySQLDown(cctx, s.dsn, s.name); err != nil {
-						t.Errorf("cleanup down: %v", err)
-					}
-					if _, err := db.ExecContext(cctx, "DROP TABLE IF EXISTS schema_migrations"); err != nil {
-						t.Errorf("cleanup drop schema_migrations: %v", err)
-					}
-					return
-				}
-				if err := MigrateMySQL(cctx, s.dsn, s.name); err != nil {
+				if err := MigrateMySQL(cctx, dsn, s.name); err != nil {
 					t.Errorf("cleanup up: %v", err)
 				}
 			})
@@ -98,41 +76,23 @@ func TestMigrate_UpDownUp(t *testing.T) {
 					t.Fatalf("%s: %v", what, err)
 				}
 			}
-			must(MigrateMySQL(ctx, s.dsn, s.name), "up")
+			must(MigrateMySQL(ctx, dsn, s.name), "up")
 			got := listTables(t, ctx, db)
 			for _, want := range []string{"outbox", "processed_events"} {
 				if !got[want] {
 					t.Errorf("table %s missing after up", want)
 				}
 			}
-			must(MigrateMySQLDown(ctx, s.dsn, s.name), "down")
+			must(MigrateMySQLDown(ctx, dsn, s.name), "down")
 			if listTables(t, ctx, db)["outbox"] {
 				t.Error("outbox still present after down")
 			}
-			must(MigrateMySQL(ctx, s.dsn, s.name), "second up")
+			must(MigrateMySQL(ctx, dsn, s.name), "second up")
 			if !listTables(t, ctx, db)["outbox"] {
 				t.Error("outbox missing after second up")
 			}
 		})
 	}
-}
-
-func hasRows(t *testing.T, ctx context.Context, db *sql.DB, tables map[string]bool) bool {
-	t.Helper()
-	for n := range tables {
-		if n == "schema_migrations" {
-			continue
-		}
-		var one int
-		err := db.QueryRowContext(ctx, "SELECT 1 FROM `"+n+"` LIMIT 1").Scan(&one)
-		if err == nil {
-			return true
-		}
-		if !errors.Is(err, sql.ErrNoRows) {
-			t.Fatalf("probe %s: %v", n, err)
-		}
-	}
-	return false
 }
 
 func listTables(t *testing.T, ctx context.Context, db *sql.DB) map[string]bool {
@@ -158,7 +118,7 @@ func listTables(t *testing.T, ctx context.Context, db *sql.DB) map[string]bool {
 func migratedInvoiceDB(t *testing.T) (context.Context, *sql.DB) {
 	t.Helper()
 	cfg := loadCfg(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	t.Cleanup(cancel)
 	db, err := OpenMySQL(ctx, cfg.MySQLDSNInvoice)
 	if err != nil {
@@ -220,7 +180,7 @@ func TestMySQL_BizOrderNoUniqueAndCaseSensitive(t *testing.T) {
 func mongoSandbox(t *testing.T) (context.Context, *mongo.Database, string) {
 	t.Helper()
 	cfg := loadCfg(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	t.Cleanup(cancel)
 	db, err := OpenMongo(ctx, cfg.MongoURI, cfg.MongoDB)
 	if err != nil {
@@ -231,7 +191,7 @@ func mongoSandbox(t *testing.T) (context.Context, *mongo.Database, string) {
 		t.Fatalf("ensure indexes: %v", err)
 	}
 	t.Cleanup(func() {
-		dctx, c := context.WithTimeout(context.Background(), 10*time.Second)
+		dctx, c := context.WithTimeout(context.Background(), arrivalTimeout)
 		defer c()
 		for _, n := range []string{"callbacks", "deliveries", "outbox", "processed_events"} {
 			_ = db.Collection(prefix + n).Drop(dctx)

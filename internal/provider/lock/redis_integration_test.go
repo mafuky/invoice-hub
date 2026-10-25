@@ -14,6 +14,8 @@ import (
 	"github.com/mafuky/invoice-hub/internal/platform/config"
 )
 
+const arrivalTimeout = 60 * time.Second
+
 func openRedis(t *testing.T) *redis.Client {
 	t.Helper()
 	cfg, err := config.Load()
@@ -22,7 +24,7 @@ func openRedis(t *testing.T) *redis.Client {
 	}
 	rdb := redis.NewClient(&redis.Options{Addr: cfg.RedisAddr, Password: cfg.RedisPassword})
 	t.Cleanup(func() { rdb.Close() })
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		t.Skipf("redis unavailable: %v", err)

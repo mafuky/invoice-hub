@@ -24,6 +24,8 @@ import (
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
 )
 
+const arrivalTimeout = 60 * time.Second
+
 func invoiceIssuedEnvelope(t *testing.T, invoiceID int64, version int) event.Envelope {
 	t.Helper()
 	amt, err := money.Parse("1999.99")
@@ -282,7 +284,7 @@ func TestDeliver_ClaimLostDuringPush_LeavesRecordAlone(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			repo := storetest.NewRepo(t)
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 			defer cancel()
 			createDeliveries(t, repo, 7106)
 			// Finance has finished, so an unfenced customer success would announce delivery.

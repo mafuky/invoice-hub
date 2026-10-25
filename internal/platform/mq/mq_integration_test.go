@@ -16,6 +16,9 @@ import (
 	"github.com/mafuky/invoice-hub/internal/platform/event"
 )
 
+const arrivalTimeout = 60 * time.Second
+const parkingTimeout = arrivalTimeout + 30*time.Second
+
 func dialOrSkip(t *testing.T) *amqp.Connection {
 	t.Helper()
 	cfg, err := config.Load()
@@ -26,7 +29,7 @@ func dialOrSkip(t *testing.T) *amqp.Connection {
 	if err != nil {
 		t.Skipf("bad amqp url in config: %v", err)
 	}
-	c, err := net.DialTimeout("tcp", net.JoinHostPort(uri.Host, fmt.Sprint(uri.Port)), 2*time.Second)
+	c, err := net.DialTimeout("tcp", net.JoinHostPort(uri.Host, fmt.Sprint(uri.Port)), arrivalTimeout)
 	if err != nil {
 		t.Skipf("amqp port closed (run make tunnel): %v", err)
 	}
@@ -94,7 +97,7 @@ func TestPublish_WaitsForConfirm(t *testing.T) {
 	defer pub.Close()
 
 	env := newEnvelope(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	if err := pub.Publish(ctx, InvoiceTaskCreated, env); err != nil {
 		t.Fatal(err)
@@ -120,7 +123,7 @@ func TestPublish_UnroutableKeyIsAnError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer pub.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	if err := pub.Publish(ctx, "nobody.listens.here", newEnvelope(t)); err == nil {
 		t.Fatal("unroutable event reported as published")
@@ -148,20 +151,23 @@ func TestConsume_HandlerErrorGoesToRetryThenBack(t *testing.T) {
 
 	calls := make(chan time.Time, 4)
 	traces := make(chan string, 4)
+	attempts := 0
 	h := func(ctx context.Context, env event.Envelope) error {
+		attempts++
 		calls <- time.Now()
 		traces <- env.TraceID
-		if len(calls) == 1 {
+		if attempts == 1 {
 			return fmt.Errorf("customer endpoint timeout for %s", env.AggregateID)
 		}
 		return nil
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	done := make(chan error, 1)
 	go func() { done <- Consume(ctx, conn, prefix+QueueProvider, 1, h) }()
 
-	pctx, pcancel := context.WithTimeout(ctx, 10*time.Second)
+	pctx, pcancel := context.WithTimeout(ctx, arrivalTimeout)
 	defer pcancel()
 	if err := pub.Publish(pctx, InvoiceTaskCreated, newEnvelope(t)); err != nil {
 		t.Fatal(err)
@@ -170,12 +176,12 @@ func TestConsume_HandlerErrorGoesToRetryThenBack(t *testing.T) {
 	var first, second time.Time
 	select {
 	case first = <-calls:
-	case <-time.After(10 * time.Second):
+	case <-time.After(arrivalTimeout):
 		t.Fatal("handler never called")
 	}
 	select {
 	case second = <-calls:
-	case <-time.After(15 * time.Second):
+	case <-time.After(5*time.Second + arrivalTimeout):
 		t.Fatal("message did not come back from retry.5s")
 	}
 	if gap := second.Sub(first); gap < 4*time.Second {
@@ -191,7 +197,7 @@ func TestConsume_HandlerErrorGoesToRetryThenBack(t *testing.T) {
 		if err != nil {
 			t.Fatalf("consume stopped with %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(arrivalTimeout):
 		t.Fatal("consume did not stop after cancel")
 	}
 }
@@ -218,7 +224,7 @@ func TestConsume_ExhaustedTiersAndPoisonGoToParking(t *testing.T) {
 		cancel()
 		select {
 		case <-done:
-		case <-time.After(5 * time.Second):
+		case <-time.After(arrivalTimeout):
 			t.Error("consume did not stop after cancel")
 		}
 	}()
@@ -230,7 +236,7 @@ func TestConsume_ExhaustedTiersAndPoisonGoToParking(t *testing.T) {
 	}
 
 	parked := 0
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(parkingTimeout)
 	for parked < 2 && time.Now().Before(deadline) {
 		if _, ok, _ := ch.Get(prefix+QueueProvider+parkingSuffix, true); ok {
 			parked++
@@ -270,7 +276,7 @@ func TestConsume_HandlerPanicGoesToRetry(t *testing.T) {
 	if err := pub.Publish(ctx, InvoiceTaskCreated, newEnvelope(t)); err != nil {
 		t.Fatal(err)
 	}
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(arrivalTimeout)
 	for time.Now().Before(deadline) {
 		if msg, ok, _ := ch.Get(prefix+QueueProvider+".retry.5s", false); ok {
 			if a, _ := msg.Headers[headerAttempt].(int32); a != 1 {

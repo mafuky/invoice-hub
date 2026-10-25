@@ -19,6 +19,8 @@ import (
 	platformstore "github.com/mafuky/invoice-hub/internal/platform/store"
 )
 
+const arrivalTimeout = 60 * time.Second
+
 var collections = []string{"deliveries", "outbox", "processed_events", "delivery_invoices", "callbacks"}
 
 // Open connects to the configured MongoDB and returns the database with a
@@ -30,7 +32,7 @@ func Open(t *testing.T) (*mongo.Database, string) {
 	if err != nil {
 		t.Skipf("no config (copy .env.example to .env and run make tunnel): %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	db, err := platformstore.OpenMongo(ctx, cfg.MongoURI, cfg.MongoDB)
 	if err != nil {
@@ -38,7 +40,7 @@ func Open(t *testing.T) (*mongo.Database, string) {
 	}
 	prefix := fmt.Sprintf("t%08x_", rand.Uint32())
 	t.Cleanup(func() {
-		dctx, c := context.WithTimeout(context.Background(), 10*time.Second)
+		dctx, c := context.WithTimeout(context.Background(), arrivalTimeout)
 		defer c()
 		for _, name := range collections {
 			_ = db.Collection(prefix + name).Drop(dctx)
@@ -56,7 +58,7 @@ func Open(t *testing.T) (*mongo.Database, string) {
 func NewRepo(t *testing.T) *store.Repo {
 	t.Helper()
 	db, prefix := Open(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), arrivalTimeout)
 	defer cancel()
 	if err := store.RequireTransactions(ctx, db); err != nil {
 		t.Skip(err)

@@ -59,7 +59,7 @@ func Terminal(status string) bool {
 	return status == "closed" || status == "failed" || status == "red_flushed"
 }
 
-// Count counts duplicate channel/version groups and affected settlement invoices.
+// Count counts invoice versions with duplicate delivery documents and affected settlement invoices.
 // Missing records or unfinished delivery count an invoice once in stuck.
 func Count(s Snapshot, now time.Time) Report {
 	r := Report{Total: len(s.Invoices)}
@@ -105,14 +105,18 @@ func Count(s Snapshot, now time.Time) Report {
 			stuck = true
 		}
 		for v := range versions {
+			duplicate := false
 			for _, channel := range []string{"customer", "finance"} {
 				k := key{v, channel}
 				if dc[k] == 0 || rc[k] == 0 {
 					stuck = true
 				}
-				if dc[k] > 1 || rc[k] > 1 {
-					r.DupDelivery++
+				if dc[k] > 1 {
+					duplicate = true
 				}
+			}
+			if duplicate {
+				r.DupDelivery++
 			}
 		}
 		if len(items[in.ID]) == 0 {
