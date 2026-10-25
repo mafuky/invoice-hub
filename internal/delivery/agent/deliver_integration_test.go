@@ -266,6 +266,112 @@ func TestDeliver_LostClaimLeavesRecordAlone(t *testing.T) {
 	}
 }
 
+type senderFunc func(context.Context, store.Delivery) error
+
+func (f senderFunc) Send(ctx context.Context, d store.Delivery) error { return f(ctx, d) }
+
+func TestDeliver_ClaimLostDuringPush_LeavesRecordAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		pushErr error
+		attempt int
+	}{
+		{"success", nil, 0},
+		{"retry", channel.ErrPush, 0},
+		{"gave_up", channel.ErrPush, MaxAttempts - 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := storetest.NewRepo(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			createDeliveries(t, repo, 7106)
+			// Finance has finished, so an unfenced customer success would announce delivery.
+			finance := agentWithHTTP(t, repo, http.StatusOK)
+			if err := finance.Deliver(ctx, findDelivery(t, repo, 7106, store.ChannelFinance)); err != nil {
+				t.Fatal(err)
+			}
+			d := findDelivery(t, repo, 7106, store.ChannelCustomer)
+			if _, err := repo.Deliveries().UpdateByID(ctx, d.ID, bson.D{{Key: "$set", Value: bson.D{
+				{Key: "attempt", Value: tc.attempt},
+			}}}); err != nil {
+				t.Fatal(err)
+			}
+			now := time.Now().UTC().Truncate(time.Millisecond)
+			claimed, oldSince, err := repo.MarkDelivering(ctx, d.ID, now.Add(-10*time.Minute))
+			if err != nil || !claimed {
+				t.Fatalf("first claim = %v, %v", claimed, err)
+			}
+			old := findDelivery(t, repo, 7106, store.ChannelCustomer)
+			entered := make(chan struct{}, 1)
+			release := make(chan struct{})
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			a := NewDeliveryAgent(repo, map[string]Sender{
+				store.ChannelCustomer: senderFunc(func(ctx context.Context, _ store.Delivery) error {
+					select {
+					case entered <- struct{}{}:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					select {
+					case <-release:
+						return tc.pushErr
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}),
+			})
+			result := make(chan error, 1)
+			finished := make(chan struct{})
+			go func() {
+				defer close(finished)
+				result <- a.Deliver(ctx, old)
+			}()
+			defer func() {
+				cancel()
+				unblock()
+				<-finished
+			}()
+			select {
+			case <-entered:
+			case err := <-result:
+				t.Fatalf("Deliver returned before the push: %v", err)
+			case <-ctx.Done():
+				t.Fatalf("waiting for push: %v", ctx.Err())
+			}
+
+			// Replace the claim only while Send is blocked, before its outcome is known.
+			if ok, err := repo.Requeue(ctx, d.ID, now.Add(-time.Minute), now); err != nil || !ok {
+				t.Fatalf("stale requeue = %v, %v", ok, err)
+			}
+			claimed, newSince, err := repo.MarkDelivering(ctx, d.ID, now)
+			if err != nil || !claimed || newSince.Equal(oldSince) {
+				t.Fatalf("second claim = %v, %v, %v", claimed, newSince, err)
+			}
+			before := findDelivery(t, repo, 7106, store.ChannelCustomer)
+			if before.Status != store.StatusDelivering || before.DeliveringSince == nil ||
+				!before.DeliveringSince.Equal(newSince) || before.Attempt != tc.attempt {
+				t.Fatalf("second claim = %+v, want delivering at %v with attempt %d", before, newSince, tc.attempt)
+			}
+			assertAnnouncementRows(t, repo, store.DeliveredKey(7106, 1), mq.DeliverySucceeded, 0)
+			unblock()
+			select {
+			case err := <-result:
+				if err != nil {
+					t.Errorf("lost claim must return nil, got %v", err)
+				}
+			case <-ctx.Done():
+				t.Fatalf("waiting for Deliver: %v", ctx.Err())
+			}
+			after := findDelivery(t, repo, 7106, store.ChannelCustomer)
+			if !reflect.DeepEqual(before, after) {
+				t.Errorf("lost claim changed record: before %+v, after %+v", before, after)
+			}
+			assertAnnouncementRows(t, repo, store.DeliveredKey(7106, 1), mq.DeliverySucceeded, 0)
+		})
+	}
+}
+
 func agentWithHTTP(t *testing.T, repo *store.Repo, status int) *DeliveryAgent {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
