@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"testing"
+	"time"
 
 	"github.com/mafuky/invoice-hub/internal/platform/money"
 	"github.com/mafuky/invoice-hub/internal/platform/testenv"
@@ -115,20 +116,109 @@ func TestInsertItem_SameInvoiceIsNotInsertedTwice(t *testing.T) {
 	db := testenv.OpenMySQL(t, "settlement")
 	r := NewRepo(db)
 	amount, _ := money.Parse("100.10")
-	it := Item{SettlementID: 1, InvoiceID: 1_000_000 + rand.Int64N(1<<40), ProductLine: "TRAIN", Amount: amount}
+	tx := begin(t, db)
+	customer := fmt.Sprintf("CUST-%08d", rand.IntN(100_000_000))
+	first, err := r.FindOrCreateSettlement(ctx, tx, "2026-10", customer, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := r.FindOrCreateSettlement(ctx, tx, "2026-11", customer, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	it := Item{SettlementID: first.ID, InvoiceID: 1_000_000 + rand.Int64N(1<<40), ProductLine: "TRAIN", Amount: amount}
 
 	if ok, err := r.InsertItem(ctx, db, it); err != nil || !ok {
 		t.Fatalf("first insert: inserted=%v err=%v", ok, err)
 	}
-	it.SettlementID = 2
+	it.SettlementID = second.ID
 	if ok, err := r.InsertItem(ctx, db, it); err != nil || ok {
 		t.Fatalf("second insert for the same invoice: inserted=%v err=%v", ok, err)
 	}
-	total, err := r.SumItems(ctx, db, 1)
+	total, err := r.SumItems(ctx, db, first.ID)
 	if err != nil || total.String() != "100.10" {
 		t.Fatalf("sum = %s err=%v", total, err)
 	}
-	if empty, err := r.SumItems(ctx, db, 424242); err != nil || empty.String() != "0.00" {
+	if empty, err := r.SumItems(ctx, db, second.ID); err != nil || empty.String() != "0.00" {
 		t.Fatalf("empty sum = %s err=%v", empty, err)
+	}
+}
+
+func TestFindOrCreateSettlement_LocksExistingRow(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "settlement")
+	r := NewRepo(db)
+	customer := fmt.Sprintf("CUST-%08d", rand.IntN(100_000_000))
+	seed := begin(t, db)
+	s, err := r.FindOrCreateSettlement(ctx, seed, "2026-10", customer, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := seed.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	locked := begin(t, db)
+	if _, err := r.FindOrCreateSettlement(ctx, locked, "2026-10", customer, "test"); err != nil {
+		t.Fatal(err)
+	}
+	other := begin(t, db)
+	blockedCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
+	defer cancel()
+	_, err = r.TransitionSettlement(blockedCtx, other, s.ID, domain.SettlementPendingSettle, domain.SettlementCalculated, s.Version, "test")
+	if err == nil || blockedCtx.Err() == nil {
+		t.Fatalf("concurrent calculation was not blocked by the row lock: %v", err)
+	}
+	_ = other.Rollback()
+	if err := locked.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	freed := begin(t, db)
+	applied, err := r.TransitionSettlement(ctx, freed, s.ID, domain.SettlementPendingSettle, domain.SettlementCalculated, s.Version, "test")
+	if err != nil || !applied {
+		t.Fatalf("calculation after unlock: applied=%v err=%v", applied, err)
+	}
+	if err := freed.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFindOrCreateOpen_RollsPastClosedPeriods(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "settlement")
+	r := NewRepo(db)
+	customer := fmt.Sprintf("CUST-%08d", rand.IntN(100_000_000))
+	tx := begin(t, db)
+	for _, period := range []string{"2026-11", "2026-12"} {
+		s, err := r.FindOrCreateSettlement(ctx, tx, period, customer, "test")
+		if err != nil {
+			t.Fatal(err)
+		}
+		applied, err := r.TransitionSettlement(ctx, tx, s.ID, domain.SettlementPendingSettle, domain.SettlementCalculated, s.Version, "test")
+		if err != nil || !applied {
+			t.Fatalf("close %s: applied=%v err=%v", period, applied, err)
+		}
+	}
+	open, err := r.FindOrCreateOpen(ctx, tx, customer, "2026-11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if open.Period != "2027-01" || open.CustomerID != customer || open.Status != domain.SettlementPendingSettle || open.Version != 1 {
+		t.Fatalf("open settlement = %+v", open)
+	}
+	again, err := r.FindOrCreateOpen(ctx, tx, customer, "2026-11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.ID != open.ID {
+		t.Fatalf("open settlement duplicated: %d != %d", again.ID, open.ID)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := stateLog(t, db, open.ID); len(got) != 2 || got[0] != ">created" || got[1] != "created>pending_settle" {
+		t.Fatalf("open settlement state log = %v", got)
 	}
 }

@@ -5,10 +5,13 @@ package app
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"reflect"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,14 +24,54 @@ import (
 	"github.com/mafuky/invoice-hub/internal/settlement/verify"
 )
 
-// matchingSupplier answers every lookup with a record that agrees with ours.
-type matchingSupplier struct {
-	amount money.Amount
-	title  string
+type lookupCall struct {
+	line, invoiceNo string
 }
 
-func (m matchingSupplier) Lookup(context.Context, string, string) (verify.SupplierInvoice, error) {
-	return verify.SupplierInvoice{Found: true, Amount: m.amount, Title: m.title, Status: "issued"}, nil
+type recordingSupplier struct {
+	mu       sync.Mutex
+	calls    []lookupCall
+	result   verify.SupplierInvoice
+	failures int
+}
+
+func (m *recordingSupplier) Lookup(_ context.Context, line, invoiceNo string) (verify.SupplierInvoice, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.calls = append(m.calls, lookupCall{line, invoiceNo})
+	if m.failures > 0 {
+		m.failures--
+		return verify.SupplierInvoice{}, verify.ErrSupplier
+	}
+	return m.result, nil
+}
+
+func newSupplier(t *testing.T) *recordingSupplier {
+	t.Helper()
+	return &recordingSupplier{result: verify.SupplierInvoice{
+		Found: true, Amount: amt(t, "100.10"), Title: "Example Travel Co., Ltd.", Status: "issued",
+	}}
+}
+
+func (m *recordingSupplier) assertCalls(t *testing.T, events ...event.Envelope) {
+	t.Helper()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	want := make(map[lookupCall]int)
+	for _, env := range events {
+		var payload event.InvoiceDelivered
+		if err := env.Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		want[lookupCall{payload.ProductLine, payload.InvoiceNo}]++
+	}
+	got := make(map[lookupCall]int)
+	for _, call := range m.calls {
+		got[call]++
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("supplier calls = %v, want %v", got, want)
+	}
 }
 
 func amt(t *testing.T, s string) money.Amount {
@@ -136,8 +179,8 @@ func TestRejectThenRecalculate_AmountReflectsChangedItems(t *testing.T) {
 		t.Fatalf("reject_reason = %q", s.RejectReason)
 	}
 
-	// The reviewer's correction: the first item was really 150.00.
-	if _, err := db.Exec(`UPDATE settlement_items SET amount = ? WHERE invoice_id = ?`, "150.00", invoices[0]); err != nil {
+	// The reviewer's correction: the second item was 150.00, not 200.20.
+	if _, err := db.Exec(`UPDATE settlement_items SET amount = ? WHERE invoice_id = ?`, "150.00", invoices[1]); err != nil {
 		t.Fatal(err)
 	}
 	if err := svc.Calculate(ctx, id); err != nil {
@@ -240,7 +283,8 @@ func TestOnInvoiceDelivered_DuplicateAddsOnce(t *testing.T) {
 	ctx := context.Background()
 	db := testenv.OpenMySQL(t, "settlement")
 	repo := store.NewRepo(db)
-	svc := NewService(db, repo, matchingSupplier{amount: amt(t, "100.10"), title: "Example Travel Co., Ltd."})
+	supplier := newSupplier(t)
+	svc := NewService(db, repo, supplier)
 
 	invoiceID, customerID := newInvoiceID(), newCustomerID()
 	env := deliveredEvent(t, invoiceID, customerID)
@@ -249,10 +293,15 @@ func TestOnInvoiceDelivered_DuplicateAddsOnce(t *testing.T) {
 			t.Fatalf("delivery %d of the same event: %v", i+1, err)
 		}
 	}
+	supplier.assertCalls(t, env)
+	settlementID := assertDelivery(t, db, env, "2026-10", true)
 	// The same invoice announced again under a new event id is absorbed by the unique item.
 	again := deliveredEvent(t, invoiceID, customerID)
 	if err := svc.OnInvoiceDelivered(ctx, again); err != nil {
 		t.Fatalf("redelivery under a new event id: %v", err)
+	}
+	if got := assertDelivery(t, db, again, "2026-10", true); got != settlementID {
+		t.Fatalf("duplicate moved from settlement %d to %d", settlementID, got)
 	}
 
 	if n := count(t, db, `SELECT COUNT(*) FROM settlement_items WHERE invoice_id = ?`, invoiceID); n != 1 {
@@ -272,5 +321,275 @@ func TestOnInvoiceDelivered_DuplicateAddsOnce(t *testing.T) {
 	}
 	if n != 1 || status != string(domain.SettlementPendingSettle) {
 		t.Fatalf("settlements for the customer in 2026-10: count=%d status=%q, want one pending_settle", n, status)
+	}
+}
+
+func assertDelivery(t *testing.T, db *sql.DB, env event.Envelope, period string, wantVerified bool) int64 {
+	t.Helper()
+	var invoice event.InvoiceDelivered
+	if err := env.Decode(&invoice); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM settlement_items WHERE invoice_id = ?`, invoice.InvoiceID); n != 1 {
+		t.Fatalf("invoice items = %d, want 1", n)
+	}
+	var settlementID int64
+	var verified bool
+	var raw []byte
+	if err := db.QueryRow(`SELECT settlement_id, verified, checks FROM settlement_items WHERE invoice_id = ?`, invoice.InvoiceID).
+		Scan(&settlementID, &verified, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var checks []verify.Check
+	if err := json.Unmarshal(raw, &checks); err != nil {
+		t.Fatalf("checks JSON: %v", err)
+	}
+	if len(checks) != 4 {
+		t.Fatalf("checks = %+v, want four", checks)
+	}
+	names := map[string]bool{verify.CheckExists: true, verify.CheckAmount: true, verify.CheckTitle: true, verify.CheckStatus: true}
+	allPassed := true
+	for _, check := range checks {
+		if !names[check.Name] {
+			t.Fatalf("unknown or duplicate check: %q", check.Name)
+		}
+		delete(names, check.Name)
+		wantPassed := wantVerified || check.Name != verify.CheckTitle
+		if check.Passed != wantPassed {
+			t.Errorf("%s passed = %v, want %v", check.Name, check.Passed, wantPassed)
+		}
+		if !check.Passed && check.Detail == "" {
+			t.Errorf("%s has no failure detail", check.Name)
+		}
+		allPassed = allPassed && check.Passed
+	}
+	if verified != allPassed || verified != wantVerified {
+		t.Errorf("verified = %v, all passed = %v, want %v", verified, allPassed, wantVerified)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM settlements WHERE id = ? AND customer_id = ? AND period = ? AND status = ?`,
+		settlementID, invoice.CustomerID, period, domain.SettlementPendingSettle); n != 1 {
+		t.Fatalf("item is not in the customer's open %s settlement", period)
+	}
+	assertProcessed(t, db, env)
+	rows, err := db.Query(`SELECT body FROM outbox WHERE routing_key = ? AND body->>'$.payload.invoice_id' = ?`,
+		mq.SettlementItemAdded, fmt.Sprint(invoice.InvoiceID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+		var body []byte
+		if err := rows.Scan(&body); err != nil {
+			t.Fatal(err)
+		}
+		var addedEnv event.Envelope
+		if err := json.Unmarshal(body, &addedEnv); err != nil {
+			t.Fatal(err)
+		}
+		var added event.ItemAdded
+		if err := addedEnv.Decode(&added); err != nil {
+			t.Fatal(err)
+		}
+		if addedEnv.Type != mq.SettlementItemAdded || added.InvoiceID != invoice.InvoiceID || added.SettlementID != settlementID {
+			t.Errorf("ItemAdded = %+v, type = %q, want invoice %d / settlement %d", added, addedEnv.Type, invoice.InvoiceID, settlementID)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Fatalf("ItemAdded rows = %d, want 1", n)
+	}
+	return settlementID
+}
+
+func assertProcessed(t *testing.T, db *sql.DB, env event.Envelope) {
+	t.Helper()
+	if n := count(t, db, `SELECT COUNT(*) FROM processed_events WHERE event_id = ? AND consumer = ?`, env.EventID, consumerName); n != 1 {
+		t.Fatalf("processed_events for %s = %d, want 1", env.EventID, n)
+	}
+}
+
+func TestOnInvoiceDelivered_VerificationAnomaly(t *testing.T) {
+	db := testenv.OpenMySQL(t, "settlement")
+	supplier := newSupplier(t)
+	supplier.result.Title = "Example Branch Co., Ltd."
+	svc := NewService(db, store.NewRepo(db), supplier)
+	env := deliveredEvent(t, newInvoiceID(), newCustomerID())
+	if err := svc.OnInvoiceDelivered(context.Background(), env); err != nil {
+		t.Fatal(err)
+	}
+	supplier.assertCalls(t, env)
+	assertDelivery(t, db, env, "2026-10", false)
+}
+
+func TestOnInvoiceDelivered_VerifyFailureRollsBackAndRetries(t *testing.T) {
+	db := testenv.OpenMySQL(t, "settlement")
+	supplier := newSupplier(t)
+	supplier.failures = 1
+	svc := NewService(db, store.NewRepo(db), supplier)
+	invoiceID, customerID := newInvoiceID(), newCustomerID()
+	env := deliveredEvent(t, invoiceID, customerID)
+	if err := svc.OnInvoiceDelivered(context.Background(), env); !errors.Is(err, verify.ErrSupplier) {
+		t.Fatalf("lookup failure = %v, want ErrSupplier", err)
+	}
+	supplier.assertCalls(t, env)
+	for _, query := range []struct {
+		sql string
+		arg any
+	}{
+		{`SELECT COUNT(*) FROM settlement_items WHERE invoice_id = ?`, invoiceID},
+		{`SELECT COUNT(*) FROM outbox WHERE body->>'$.payload.invoice_id' = ?`, fmt.Sprint(invoiceID)},
+		{`SELECT COUNT(*) FROM processed_events WHERE event_id = ?`, env.EventID},
+		{`SELECT COUNT(*) FROM settlements WHERE customer_id = ?`, customerID},
+	} {
+		if n := count(t, db, query.sql, query.arg); n != 0 {
+			t.Errorf("rollback left %d rows: %s", n, query.sql)
+		}
+	}
+	if err := svc.OnInvoiceDelivered(context.Background(), env); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	supplier.assertCalls(t, env, env)
+	assertDelivery(t, db, env, "2026-10", true)
+}
+
+func TestOnInvoiceDelivered_ConcurrentInvoicesShareSettlement(t *testing.T) {
+	db := testenv.OpenMySQL(t, "settlement")
+	supplier := newSupplier(t)
+	svc := NewService(db, store.NewRepo(db), supplier)
+	customerID := newCustomerID()
+	events := []event.Envelope{deliveredEvent(t, newInvoiceID(), customerID), deliveredEvent(t, newInvoiceID(), customerID)}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := make(chan struct{})
+	errc := make(chan error, len(events))
+	for _, env := range events {
+		go func() { <-start; errc <- svc.OnInvoiceDelivered(ctx, env) }()
+	}
+	close(start)
+	for range events {
+		if err := <-errc; err != nil {
+			t.Errorf("concurrent delivery: %v", err)
+		}
+	}
+	if t.Failed() {
+		return
+	}
+	supplier.assertCalls(t, events...)
+	first := assertDelivery(t, db, events[0], "2026-10", true)
+	second := assertDelivery(t, db, events[1], "2026-10", true)
+	if first != second {
+		t.Fatalf("different settlements: %d, %d", first, second)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM settlements WHERE customer_id = ? AND period = ?`, customerID, "2026-10"); n != 1 {
+		t.Errorf("settlements = %d, want 1", n)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM settlement_items WHERE settlement_id = ?`, first); n != 2 {
+		t.Errorf("items = %d, want 2", n)
+	}
+}
+
+func TestOnInvoiceDelivered_UTCMonthBoundary(t *testing.T) {
+	db := testenv.OpenMySQL(t, "settlement")
+	supplier := newSupplier(t)
+	svc := NewService(db, store.NewRepo(db), supplier)
+	customerID := newCustomerID()
+	var events []event.Envelope
+	for _, tc := range []struct{ deliveredAt, period string }{
+		{"2026-10-31T23:30:00Z", "2026-10"},
+		{"2026-11-01T00:10:00Z", "2026-11"},
+	} {
+		env := deliveredEvent(t, newInvoiceID(), customerID)
+		var payload event.InvoiceDelivered
+		if err := env.Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		payload.DeliveredAt, err = time.Parse(time.RFC3339, tc.deliveredAt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.Payload, err = json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.OccurredAt = time.Date(2026, 12, 1, 0, 0, 0, 0, time.UTC)
+		if err := svc.OnInvoiceDelivered(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+		assertDelivery(t, db, env, tc.period, true)
+		events = append(events, env)
+	}
+	supplier.assertCalls(t, events...)
+	if n := count(t, db, `SELECT COUNT(*) FROM settlements WHERE customer_id = ?`, customerID); n != 2 {
+		t.Errorf("settlements = %d, want 2", n)
+	}
+}
+
+func TestOnInvoiceDelivered_LateInvoiceRollsToNextPeriod(t *testing.T) {
+	for _, status := range []domain.SettlementStatus{domain.SettlementCalculated, domain.SettlementPendingReview, domain.SettlementPaid} {
+		t.Run(string(status), func(t *testing.T) {
+			ctx := context.Background()
+			db := testenv.OpenMySQL(t, "settlement")
+			repo := store.NewRepo(db)
+			supplier := newSupplier(t)
+			svc := NewService(db, repo, supplier)
+			id, _ := seedSettlement(t, db, repo, "200.20")
+			if err := svc.Calculate(ctx, id); err != nil {
+				t.Fatal(err)
+			}
+			if status != domain.SettlementCalculated {
+				if err := svc.SubmitReview(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if status == domain.SettlementPaid {
+				if err := svc.Approve(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+				if err := svc.Pay(ctx, id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, err := repo.GetSettlement(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			items, err := repo.ListItems(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env := deliveredEvent(t, newInvoiceID(), before.CustomerID)
+			for range 2 {
+				if err := svc.OnInvoiceDelivered(ctx, env); err != nil {
+					t.Fatal(err)
+				}
+				novemberID := assertDelivery(t, db, env, "2026-11", true)
+				if got := transitions(t, db, novemberID); !slices.Equal(got, []string{">created", "created>pending_settle"}) {
+					t.Errorf("November state log = %v", got)
+				}
+				after, err := repo.GetSettlement(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				afterItems, err := repo.ListItems(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(items, afterItems) {
+					t.Fatalf("late delivery changed October: before=%+v after=%+v", before, after)
+				}
+				if n := count(t, db, `SELECT COUNT(*) FROM settlement_items WHERE settlement_id = ?`, novemberID); n != 1 {
+					t.Errorf("November items = %d, want 1", n)
+				}
+			}
+			supplier.assertCalls(t, env)
+			if n := count(t, db, `SELECT COUNT(*) FROM settlements WHERE customer_id = ?`, before.CustomerID); n != 2 {
+				t.Errorf("settlements after replay = %d, want 2", n)
+			}
+		})
 	}
 }

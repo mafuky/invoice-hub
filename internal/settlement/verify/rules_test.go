@@ -51,63 +51,67 @@ func TestVerify_FlagsFourAnomalyKinds(t *testing.T) {
 		{"title differs", func(s *SupplierInvoice) { s.Title = "Example Travel Co., Ltd. (Branch)" }, CheckTitle},
 		{"status differs", func(s *SupplierInvoice) { s.Status = "red_flushed" }, CheckStatus},
 	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			ours, theirs := matching(t)
-			c.change(&theirs)
-			got := byName(t, Run("TRAIN", ours, theirs))
-			for name, chk := range got {
-				if want := name != c.failed; chk.Passed != want {
-					t.Errorf("%s: passed=%v, want %v (%s)", name, chk.Passed, want, chk.Detail)
+	for _, line := range []string{"FLIGHT", "TRAIN", "HOTEL"} {
+		t.Run(line, func(t *testing.T) {
+			for _, c := range cases {
+				t.Run(c.name, func(t *testing.T) {
+					ours, theirs := matching(t)
+					c.change(&theirs)
+					got := byName(t, Run(line, ours, theirs))
+					for name, chk := range got {
+						if want := name != c.failed; chk.Passed != want {
+							t.Errorf("%s: passed=%v, want %v (%s)", name, chk.Passed, want, chk.Detail)
+						}
+					}
+					if got[c.failed].Detail == "" {
+						t.Errorf("%s failed without a detail", c.failed)
+					}
+				})
+			}
+
+			t.Run("not found", func(t *testing.T) {
+				ours, _ := matching(t)
+				got := byName(t, Run(line, ours, SupplierInvoice{}))
+				for name, chk := range got {
+					if chk.Passed {
+						t.Errorf("%s passed for an invoice the supplier does not know", name)
+					}
+					if chk.Detail == "" {
+						t.Errorf("%s has no detail", name)
+					}
 				}
-			}
-			if got[c.failed].Detail == "" {
-				t.Errorf("%s failed without a detail", c.failed)
-			}
+			})
+
+			t.Run("all match", func(t *testing.T) {
+				ours, theirs := matching(t)
+				for name, chk := range byName(t, Run(line, ours, theirs)) {
+					if !chk.Passed {
+						t.Errorf("%s failed on matching records: %s", name, chk.Detail)
+					}
+				}
+			})
 		})
 	}
-
-	t.Run("not found", func(t *testing.T) {
-		ours, _ := matching(t)
-		got := byName(t, Run("TRAIN", ours, SupplierInvoice{}))
-		for name, chk := range got {
-			if chk.Passed {
-				t.Errorf("%s passed for an invoice the supplier does not know", name)
-			}
-			if chk.Detail == "" {
-				t.Errorf("%s has no detail", name)
-			}
-		}
-	})
-
-	t.Run("all match", func(t *testing.T) {
-		ours, theirs := matching(t)
-		for name, chk := range byName(t, Run("TRAIN", ours, theirs)) {
-			if !chk.Passed {
-				t.Errorf("%s failed on matching records: %s", name, chk.Detail)
-			}
-		}
-	})
 }
 
-func TestVerify_HotelToleratesOneCent(t *testing.T) {
+func TestVerify_AmountBoundaries(t *testing.T) {
 	ours := InvoiceView{Amount: amt(t, "100.00"), Title: "Example Travel Co., Ltd.", Status: "issued"}
-	theirs := SupplierInvoice{Found: true, Amount: amt(t, "100.01"), Title: "Example Travel Co., Ltd.", Status: "issued"}
-
-	if got := byName(t, Run("HOTEL", ours, theirs)); !got[CheckAmount].Passed {
-		t.Errorf("hotel amount off by one cent should pass: %s", got[CheckAmount].Detail)
-	}
-	if got := byName(t, Run("FLIGHT", ours, theirs)); got[CheckAmount].Passed {
-		t.Error("flight amount off by one cent should fail")
-	}
-
-	theirs.Amount = amt(t, "100.02")
-	if got := byName(t, Run("HOTEL", ours, theirs)); got[CheckAmount].Passed {
-		t.Error("hotel amount off by two cents should fail")
-	}
-	theirs.Amount = amt(t, "99.99")
-	if got := byName(t, Run("HOTEL", ours, theirs)); !got[CheckAmount].Passed {
-		t.Error("hotel tolerance applies in both directions")
+	for _, line := range []string{"FLIGHT", "TRAIN", "HOTEL"} {
+		for _, amount := range []string{"100.00", "100.01", "99.99", "100.02", "99.98"} {
+			t.Run(line+"/"+amount, func(t *testing.T) {
+				theirs := SupplierInvoice{Found: true, Amount: amt(t, amount), Title: ours.Title, Status: ours.Status}
+				wantAmount := amount == "100.00" || line == "HOTEL" && (amount == "100.01" || amount == "99.99")
+				for name, check := range byName(t, Run(line, ours, theirs)) {
+					want := name != CheckAmount || wantAmount
+					if check.Passed != want {
+						t.Errorf("%s: passed=%v, want %v", name, check.Passed, want)
+					}
+					if !check.Passed && check.Detail == "" {
+						t.Errorf("%s failed without a detail", name)
+					}
+				}
+			})
+		}
 	}
 }
 

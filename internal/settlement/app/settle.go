@@ -37,18 +37,22 @@ func NewService(db *sql.DB, repo *store.Repo, verifier Verifier) *Service {
 }
 
 // OnInvoiceDelivered is the handler of invoice.invoice.delivered events: it
-// adds the delivered invoice to the statement of its customer for the month
-// of delivery (period is delivered_at in UTC as YYYY-MM), checks the invoice
+// adds the delivered invoice to an open statement of its customer, starting
+// with the delivery month (delivered_at in UTC as YYYY-MM), checks the invoice
 // against the supplier's record and announces the item with
 // settlement.item.added.
 //
 // Invariant: an invoice is in at most one settlement item, however often its
 // delivered event arrives; the statement, the item with its verification
 // result and the outbox event are written together or not at all, and a
-// duplicate adds nothing and announces nothing.
+// duplicate adds nothing and announces nothing. Only pending_settle accepts
+// new items. A late invoice rolls forward one month at a time for the same
+// customer until an open statement is available; a missing statement starts
+// as created and becomes pending_settle.
 //
 // If the same delivered invoice is added twice, the customer is charged twice
-// for one trip and the supplier is paid twice.
+// for one trip and the supplier is paid twice. Adding to a statement that has
+// left pending_settle silently changes an already reviewed or paid total.
 func (s *Service) OnInvoiceDelivered(ctx context.Context, env event.Envelope) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }

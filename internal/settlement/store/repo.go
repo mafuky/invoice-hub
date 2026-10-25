@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 
@@ -124,12 +125,14 @@ func (r *Repo) ListSettlements(ctx context.Context, status string) ([]domain.Set
 // creating it inside tx when it does not exist yet. A new settlement is
 // written as created and moved to pending_settle at once, so it is ready for
 // items; both moves are in state_log. If another transaction creates the same
-// settlement first, the existing row is returned.
+// settlement first, the existing row is returned. The returned row is locked
+// until tx ends, including when it already existed. This is finished code.
 func (r *Repo) FindOrCreateSettlement(ctx context.Context, tx *sql.Tx, period, customerID, cause string) (domain.Settlement, error) {
 	s, err := scanSettlement(tx.QueryRowContext(ctx,
 		`SELECT `+settlementCols+` FROM settlements WHERE period = ? AND customer_id = ?`, period, customerID))
 	if err == nil {
-		return s, nil
+		// Lock by primary key only after finding a row, avoiding missing-key gap locks.
+		return r.GetSettlementForUpdate(ctx, tx, s.ID)
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return domain.Settlement{}, fmt.Errorf("store: find settlement %s/%s: %w", period, customerID, err)
@@ -164,7 +167,28 @@ func (r *Repo) FindOrCreateSettlement(ctx context.Context, tx *sql.Tx, period, c
 	if !applied {
 		return domain.Settlement{}, fmt.Errorf("settlement %d: new settlement could not be opened: %w", id, domain.ErrRefused)
 	}
-	return r.GetSettlementTx(ctx, tx, id)
+	return r.GetSettlementForUpdate(ctx, tx, id)
+}
+
+// FindOrCreateOpen is finished code. It returns a locked pending_settle row
+// for this customer, advancing month by month past statements closed to items.
+// Missing statements receive the created and pending_settle state log entries.
+// The caller must keep tx open through the item insert to exclude Calculate.
+func (r *Repo) FindOrCreateOpen(ctx context.Context, tx *sql.Tx, customerID, period string) (domain.Settlement, error) {
+	month, err := time.Parse("2006-01", period)
+	if err != nil {
+		return domain.Settlement{}, fmt.Errorf("store: invalid settlement period %q: %w", period, err)
+	}
+	for {
+		s, err := r.FindOrCreateSettlement(ctx, tx, month.Format("2006-01"), customerID, "invoice.invoice.delivered")
+		if err != nil {
+			return domain.Settlement{}, err
+		}
+		if s.Status == domain.SettlementPendingSettle {
+			return s, nil
+		}
+		month = month.AddDate(0, 1, 0)
+	}
 }
 
 // TransitionSettlement moves settlement id from one state to another inside
