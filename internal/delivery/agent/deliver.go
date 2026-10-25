@@ -67,6 +67,8 @@ func NextRetry(attempt int, base, max time.Duration, rnd *rand.Rand) time.Durati
 // Invariant: each channel has exactly one delivery for an invoice version,
 // however many times the event arrives, and the delivery carries what the
 // receiver needs to recognise a repeated push (invoice id and version).
+// The invoice-version summary document must exist before deliveries start
+// (Repo.EnsureInvoiceSummary).
 //
 // If the event is handled twice and a second delivery is queued, the customer
 // receives the same invoice twice and finance books it twice.
@@ -74,7 +76,8 @@ func (a *DeliveryAgent) OnInvoiceIssued(ctx context.Context, env event.Envelope)
 	return fmt.Errorf("lesson 6: %w", errors.ErrUnsupported)
 }
 
-// Deliver pushes one pending delivery to its channel and records the outcome.
+// Deliver pushes a pending delivery, or one carrying its existing claim's
+// DeliveringSince, to its channel and records the outcome.
 //
 // Invariant: delivery is at least once: a push is never skipped because an
 // earlier answer was lost. The record ends up in exactly one of delivered,
@@ -83,9 +86,9 @@ func (a *DeliveryAgent) OnInvoiceIssued(ctx context.Context, env event.Envelope)
 // is announced once, only after both channels have delivered; the gave-up
 // event is announced once per invoice version. Whether to announce is decided
 // by Repo.RecordChannelOutcome, and the outbox row is written only when it says
-// so, in the same transaction that records the outcome. A record that another
-// worker already took, or whose claim was lost (store.ErrClaimLost), is left
-// alone, and that is not an error to retry.
+// so; announcements and channel outcomes commit together. A record that another worker already took, or
+// whose claim was lost (store.ErrClaimLost), is left alone with no announcement,
+// and Deliver returns nil. Completed deliveries also return nil unchanged.
 //
 // If the customer endpoint processed a push but its answer timed out, the push
 // is repeated and the customer receives the invoice twice unless the receiver

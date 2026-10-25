@@ -319,6 +319,23 @@ func (r *Repo) InsertOutbox(ctx context.Context, routingKey string, env event.En
 	return outbox.Insert(ctx, r.outbox, routingKey, env, dedupeKey)
 }
 
+// EnsureInvoiceSummary creates the invoice-version summary before deliveries
+// become available to workers. Repeated issued events preserve recorded outcomes
+// and announcements. Call it outside the channel outcome transactions.
+func (r *Repo) EnsureInvoiceSummary(ctx context.Context, invoiceID int64, version int) error {
+	id := bson.D{{Key: "invoice_id", Value: invoiceID}, {Key: "version", Value: version}}
+	_, err := r.invoices.UpdateOne(ctx, bson.D{{Key: "_id", Value: id}}, bson.D{
+		{Key: "$setOnInsert", Value: bson.D{
+			{Key: "delivered_announced", Value: false},
+			{Key: "gave_up_announced", Value: false},
+		}},
+	}, options.UpdateOne().SetUpsert(true))
+	if err != nil {
+		return fmt.Errorf("store: prepare invoice %d v%d delivery summary: %w", invoiceID, version, err)
+	}
+	return nil
+}
+
 // RecordChannelOutcome notes that a channel of an invoice version ended and
 // reports which announcements the caller must now write to the outbox.
 // It must run inside the delivery transaction, and it goes through one summary

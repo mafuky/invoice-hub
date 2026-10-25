@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"time"
@@ -50,6 +51,12 @@ func EnsureMongoIndexesWithPrefix(ctx context.Context, db *mongo.Database, prefi
 }
 
 func ensureIndexes(ctx context.Context, db *mongo.Database, prefix string) error {
+	if err := db.CreateCollection(ctx, prefix+"delivery_invoices"); err != nil {
+		var commandErr mongo.CommandError
+		if !errors.As(err, &commandErr) || commandErr.Code != 48 {
+			return fmt.Errorf("store: create delivery invoice summaries: %w", err)
+		}
+	}
 	uniq := func(name string, keys bson.D) mongo.IndexModel {
 		return mongo.IndexModel{Keys: keys, Options: options.Index().SetName(name).SetUnique(true)}
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/mafuky/invoice-hub/internal/delivery/store/storetest"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
+	platformstore "github.com/mafuky/invoice-hub/internal/platform/store"
 )
 
 func customerDelivery(invoiceID int64) store.NewDelivery {
@@ -187,6 +188,9 @@ func TestRepo_RecordChannelOutcome_ConcurrentChannelsAnnounceDeliveredOnce(t *te
 
 	for round := 0; round < 5; round++ {
 		invoiceID := int64(7100 + round)
+		if err := repo.EnsureInvoiceSummary(ctx, invoiceID, 1); err != nil {
+			t.Fatal(err)
+		}
 		var wg sync.WaitGroup
 		var mu sync.Mutex
 		announced := 0
@@ -219,5 +223,42 @@ func TestRepo_RecordChannelOutcome_ConcurrentChannelsAnnounceDeliveredOnce(t *te
 		if announced != 1 {
 			t.Fatalf("round %d: %d transactions announced delivered, want exactly 1", round, announced)
 		}
+	}
+}
+
+func TestRepo_EnsureInvoiceSummary_PreservesAnnouncements(t *testing.T) {
+	ctx := context.Background()
+	repo := storetest.NewRepo(t)
+	for i, ch := range []string{store.ChannelCustomer, store.ChannelFinance, store.ChannelFinance} {
+		if err := repo.EnsureInvoiceSummary(ctx, 7201, 1); err != nil {
+			t.Fatal(err)
+		}
+		var delivered, gaveUp bool
+		if err := repo.WithTx(ctx, func(ctx context.Context) error {
+			var err error
+			delivered, gaveUp, err = repo.RecordChannelOutcome(ctx, 7201, 1, ch, store.OutcomeDelivered)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if gaveUp {
+			t.Fatal("successful delivery announced gave up")
+		}
+		// Only the first finance outcome completes both channels.
+		if delivered != (i == 1) {
+			t.Fatalf("outcome %d announced delivered = %v, want %v", i, delivered, i == 1)
+		}
+	}
+}
+
+func TestRepo_InvoiceSummaryCollectionExistsBeforeDelivery(t *testing.T) {
+	ctx := context.Background()
+	db, prefix := storetest.Open(t)
+	names, err := db.ListCollectionNames(ctx, bson.D{{Key: "name", Value: prefix + "delivery_invoices"}})
+	if err != nil || len(names) != 1 {
+		t.Fatalf("summary collections = %v (err %v), want one before any delivery", names, err)
+	}
+	if err := platformstore.EnsureMongoIndexesWithPrefix(ctx, db, prefix); err != nil {
+		t.Fatalf("repeated index setup: %v", err)
 	}
 }
