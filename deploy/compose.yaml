@@ -1,0 +1,87 @@
+name: invoice-hub
+
+services:
+  mysql:
+    image: mysql:8.4.11
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      MYSQL_ROOT_PASSWORD: ${INVHUB_MYSQL_ROOT_PASSWORD:?required}
+      MYSQL_APP_PASSWORD: ${INVHUB_MYSQL_APP_PASSWORD:?required}
+    command: ["--innodb-buffer-pool-size=256M", "--max-connections=100", "--performance-schema=OFF"]
+    ports: ["127.0.0.1:23306:3306"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./mysql-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "MYSQL_PWD=\"$$MYSQL_ROOT_PASSWORD\" mysql -uroot -Nse 'SELECT 1' >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  redis:
+    image: redis:8.8.3
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      REDIS_PASSWORD: ${INVHUB_REDIS_PASSWORD:?required}
+    command: ["sh", "-c", "exec redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes --maxmemory 128mb --maxmemory-policy noeviction"]
+    ports: ["127.0.0.1:26379:6379"]
+    volumes: ["redis-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -qx PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  rabbitmq:
+    image: rabbitmq:4.3.6-management
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      RABBITMQ_DEFAULT_USER: app
+      RABBITMQ_DEFAULT_PASS: ${INVHUB_RABBITMQ_PASSWORD:?required}
+      RABBITMQ_DEFAULT_VHOST: /
+      RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS: "-rabbit vm_memory_high_watermark {absolute,402653184}"
+    ports: ["127.0.0.1:25672:5672", "127.0.0.1:35672:15672"]
+    volumes: ["rabbitmq-data:/var/lib/rabbitmq"]
+    healthcheck:
+      test: ["CMD-SHELL", "rabbitmq-diagnostics -q ping && rabbitmq-diagnostics -q check_port_connectivity"]
+      interval: 15s
+      timeout: 10s
+      retries: 12
+      start_period: 45s
+
+  mongo:
+    image: mongo:8.0.32
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: ${INVHUB_MONGO_ROOT_PASSWORD:?required}
+      MONGO_APP_PASSWORD: ${INVHUB_MONGO_APP_PASSWORD:?required}
+      MONGO_KEYFILE_CONTENT: ${INVHUB_MONGO_KEYFILE:?required}
+    entrypoint: ["bash", "/opt/invoice-mongo/entrypoint.sh"]
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all", "--keyFile", "/data/keyfile/key", "--wiredTigerCacheSizeGB", "0.25"]
+    ports: ["127.0.0.1:37017:27017"]
+    volumes:
+      - mongo-data:/data/db
+      - mongo-config:/data/configdb
+      - mongo-key:/data/keyfile
+      - ./mongo-init:/opt/invoice-mongo:ro
+      - ./mongo-init/01-app.js:/docker-entrypoint-initdb.d/01-app.js:ro
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "/opt/invoice-mongo/health.js"]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 40s
+
+volumes:
+  mysql-data:
+  redis-data:
+  rabbitmq-data:
+  mongo-data:
+  mongo-config:
+  mongo-key:
