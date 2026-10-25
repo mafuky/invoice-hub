@@ -294,13 +294,13 @@ func TestOnInvoiceDelivered_DuplicateAddsOnce(t *testing.T) {
 		}
 	}
 	supplier.assertCalls(t, env)
-	settlementID := assertDelivery(t, db, env, "2026-10", true)
+	settlementID := assertDelivery(t, db, env, "2026-10")
 	// The same invoice announced again under a new event id is absorbed by the unique item.
 	again := deliveredEvent(t, invoiceID, customerID)
 	if err := svc.OnInvoiceDelivered(ctx, again); err != nil {
 		t.Fatalf("redelivery under a new event id: %v", err)
 	}
-	if got := assertDelivery(t, db, again, "2026-10", true); got != settlementID {
+	if got := assertDelivery(t, db, again, "2026-10"); got != settlementID {
 		t.Fatalf("duplicate moved from settlement %d to %d", settlementID, got)
 	}
 
@@ -324,7 +324,7 @@ func TestOnInvoiceDelivered_DuplicateAddsOnce(t *testing.T) {
 	}
 }
 
-func assertDelivery(t *testing.T, db *sql.DB, env event.Envelope, period string, wantVerified bool) int64 {
+func assertDelivery(t *testing.T, db *sql.DB, env event.Envelope, period string) int64 {
 	t.Helper()
 	var invoice event.InvoiceDelivered
 	if err := env.Decode(&invoice); err != nil {
@@ -334,37 +334,14 @@ func assertDelivery(t *testing.T, db *sql.DB, env event.Envelope, period string,
 		t.Fatalf("invoice items = %d, want 1", n)
 	}
 	var settlementID int64
-	var verified bool
 	var raw []byte
-	if err := db.QueryRow(`SELECT settlement_id, verified, checks FROM settlement_items WHERE invoice_id = ?`, invoice.InvoiceID).
-		Scan(&settlementID, &verified, &raw); err != nil {
+	if err := db.QueryRow(`SELECT settlement_id, COALESCE(checks, 'null') FROM settlement_items WHERE invoice_id = ?`, invoice.InvoiceID).
+		Scan(&settlementID, &raw); err != nil {
 		t.Fatal(err)
 	}
-	var checks []verify.Check
+	var checks []json.RawMessage
 	if err := json.Unmarshal(raw, &checks); err != nil {
 		t.Fatalf("checks JSON: %v", err)
-	}
-	if len(checks) != 4 {
-		t.Fatalf("checks = %+v, want four", checks)
-	}
-	names := map[string]bool{verify.CheckExists: true, verify.CheckAmount: true, verify.CheckTitle: true, verify.CheckStatus: true}
-	allPassed := true
-	for _, check := range checks {
-		if !names[check.Name] {
-			t.Fatalf("unknown or duplicate check: %q", check.Name)
-		}
-		delete(names, check.Name)
-		wantPassed := wantVerified || check.Name != verify.CheckTitle
-		if check.Passed != wantPassed {
-			t.Errorf("%s passed = %v, want %v", check.Name, check.Passed, wantPassed)
-		}
-		if !check.Passed && check.Detail == "" {
-			t.Errorf("%s has no failure detail", check.Name)
-		}
-		allPassed = allPassed && check.Passed
-	}
-	if verified != allPassed || verified != wantVerified {
-		t.Errorf("verified = %v, all passed = %v, want %v", verified, allPassed, wantVerified)
 	}
 	if n := count(t, db, `SELECT COUNT(*) FROM settlements WHERE id = ? AND customer_id = ? AND period = ? AND status = ?`,
 		settlementID, invoice.CustomerID, period, domain.SettlementPendingSettle); n != 1 {
@@ -422,7 +399,64 @@ func TestOnInvoiceDelivered_VerificationAnomaly(t *testing.T) {
 		t.Fatal(err)
 	}
 	supplier.assertCalls(t, env)
-	assertDelivery(t, db, env, "2026-10", false)
+	assertDelivery(t, db, env, "2026-10")
+}
+
+// TestOnInvoiceDelivered_StoresVerificationChecks also requires lesson 8 (verify.Run).
+func TestOnInvoiceDelivered_StoresVerificationChecks(t *testing.T) {
+	for _, tc := range []struct {
+		name, title  string
+		wantVerified bool
+	}{
+		{"matching", "Example Travel Co., Ltd.", true},
+		{"title mismatch", "Example Branch Co., Ltd.", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := testenv.OpenMySQL(t, "settlement")
+			supplier := newSupplier(t)
+			supplier.result.Title = tc.title
+			svc := NewService(db, store.NewRepo(db), supplier)
+			invoiceID := newInvoiceID()
+			env := deliveredEvent(t, invoiceID, newCustomerID())
+			if err := svc.OnInvoiceDelivered(context.Background(), env); err != nil {
+				t.Fatal(err)
+			}
+			supplier.assertCalls(t, env)
+			assertDelivery(t, db, env, "2026-10")
+			var verified bool
+			var raw []byte
+			if err := db.QueryRow(`SELECT verified, checks FROM settlement_items WHERE invoice_id = ?`, invoiceID).
+				Scan(&verified, &raw); err != nil {
+				t.Fatal(err)
+			}
+			var checks []verify.Check
+			if err := json.Unmarshal(raw, &checks); err != nil {
+				t.Fatalf("checks JSON: %v", err)
+			}
+			if len(checks) != 4 {
+				t.Fatalf("checks = %+v, want four", checks)
+			}
+			names := map[string]bool{verify.CheckExists: true, verify.CheckAmount: true, verify.CheckTitle: true, verify.CheckStatus: true}
+			allPassed := true
+			for _, check := range checks {
+				if !names[check.Name] {
+					t.Fatalf("unknown or duplicate check: %q", check.Name)
+				}
+				delete(names, check.Name)
+				wantPassed := tc.wantVerified || check.Name != verify.CheckTitle
+				if check.Passed != wantPassed {
+					t.Errorf("%s passed = %v, want %v", check.Name, check.Passed, wantPassed)
+				}
+				if !check.Passed && check.Detail == "" {
+					t.Errorf("%s has no failure detail", check.Name)
+				}
+				allPassed = allPassed && check.Passed
+			}
+			if verified != allPassed || verified != tc.wantVerified {
+				t.Errorf("verified = %v, all passed = %v, want %v", verified, allPassed, tc.wantVerified)
+			}
+		})
+	}
 }
 
 func TestOnInvoiceDelivered_VerifyFailureRollsBackAndRetries(t *testing.T) {
@@ -453,7 +487,7 @@ func TestOnInvoiceDelivered_VerifyFailureRollsBackAndRetries(t *testing.T) {
 		t.Fatalf("retry: %v", err)
 	}
 	supplier.assertCalls(t, env, env)
-	assertDelivery(t, db, env, "2026-10", true)
+	assertDelivery(t, db, env, "2026-10")
 }
 
 func TestOnInvoiceDelivered_ConcurrentInvoicesShareSettlement(t *testing.T) {
@@ -479,8 +513,8 @@ func TestOnInvoiceDelivered_ConcurrentInvoicesShareSettlement(t *testing.T) {
 		return
 	}
 	supplier.assertCalls(t, events...)
-	first := assertDelivery(t, db, events[0], "2026-10", true)
-	second := assertDelivery(t, db, events[1], "2026-10", true)
+	first := assertDelivery(t, db, events[0], "2026-10")
+	second := assertDelivery(t, db, events[1], "2026-10")
 	if first != second {
 		t.Fatalf("different settlements: %d, %d", first, second)
 	}
@@ -501,6 +535,7 @@ func TestOnInvoiceDelivered_UTCMonthBoundary(t *testing.T) {
 	for _, tc := range []struct{ deliveredAt, period string }{
 		{"2026-10-31T23:30:00Z", "2026-10"},
 		{"2026-11-01T00:10:00Z", "2026-11"},
+		{"2026-11-01T00:30:00+08:00", "2026-10"},
 	} {
 		env := deliveredEvent(t, newInvoiceID(), customerID)
 		var payload event.InvoiceDelivered
@@ -520,7 +555,7 @@ func TestOnInvoiceDelivered_UTCMonthBoundary(t *testing.T) {
 		if err := svc.OnInvoiceDelivered(context.Background(), env); err != nil {
 			t.Fatal(err)
 		}
-		assertDelivery(t, db, env, tc.period, true)
+		assertDelivery(t, db, env, tc.period)
 		events = append(events, env)
 	}
 	supplier.assertCalls(t, events...)
@@ -567,7 +602,7 @@ func TestOnInvoiceDelivered_LateInvoiceRollsToNextPeriod(t *testing.T) {
 				if err := svc.OnInvoiceDelivered(ctx, env); err != nil {
 					t.Fatal(err)
 				}
-				novemberID := assertDelivery(t, db, env, "2026-11", true)
+				novemberID := assertDelivery(t, db, env, "2026-11")
 				if got := transitions(t, db, novemberID); !slices.Equal(got, []string{">created", "created>pending_settle"}) {
 					t.Errorf("November state log = %v", got)
 				}
