@@ -414,3 +414,35 @@ func newRepo(t *testing.T, db *sql.DB, impl string) store.Store {
 	}
 	return store.NewRepo(db)
 }
+
+func TestHandle_PersistenceRouting(t *testing.T) {
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			db := testenv.OpenMySQL(t, "provider")
+			order := submittedOrder(t, db)
+			inserted := 0
+			insert := func(ctx context.Context, tx *sql.Tx, key string, env event.Envelope) error {
+				inserted++
+				var outcome event.TaskOutcome
+				if err := env.Decode(&outcome); err != nil {
+					t.Fatal(err)
+				}
+				if tx == nil || key != mq.ProviderTaskSucceeded || outcome.TaskID != order.TaskID {
+					t.Fatal("wrong outbox routing arguments")
+				}
+				return outbox.ForImplementation(impl)(ctx, tx, key, env)
+			}
+			h := NewHandler(db, newRepo(t, db, impl), lock.New(openRedis(t)), WithPersistence(insert))
+			res, err := h.Handle(context.Background(), Callback{Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 1, Outcome: OutcomeSucceeded, InvoiceNo: "AIR-A-12345678"})
+			if inserted != 1 {
+				t.Fatalf("insert=%d err=%v", inserted, err)
+			}
+			if err != nil || res != Accepted {
+				t.Fatalf("result=%v err=%v", res, err)
+			}
+			if got := reload(t, db, order); got.Status != store.StatusSucceeded {
+				t.Fatalf("order=%+v", got)
+			}
+		})
+	}
+}

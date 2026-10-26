@@ -4,7 +4,9 @@ package store_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
+	"reflect"
 	"testing"
 
 	"github.com/mafuky/invoice-hub/internal/invoice/domain"
@@ -37,6 +39,134 @@ func stateLogRows(t *testing.T, q store.DBTX, entity string, id int64) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+type stateLog struct {
+	Entity          string
+	ID              int64
+	From, To, Cause string
+	EventID         sql.NullString
+}
+
+func assertStateLogs(t *testing.T, q store.DBTX, entity string, id int64, want ...stateLog) {
+	t.Helper()
+	rows, err := q.QueryContext(context.Background(), `SELECT entity, entity_id, from_status, to_status, cause, event_id FROM state_log WHERE entity=? AND entity_id=? ORDER BY id`, entity, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []stateLog
+	for rows.Next() {
+		var row stateLog
+		if err := rows.Scan(&row.Entity, &row.ID, &row.From, &row.To, &row.Cause, &row.EventID); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, row)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("state logs=%+v, want %+v", got, want)
+	}
+}
+
+func TestTransitionInvoice_WrongFromLeavesStateAndLogUnchanged(t *testing.T) {
+	forEachStore(t, func(t *testing.T, r *testRepo) {
+		ctx := context.Background()
+		id := seedInvoice(t, r)
+		tx, err := r.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		applied, err := r.TransitionInvoice(ctx, tx, id, domain.InvoiceIssuing, domain.InvoiceIssued, 0, "provider.task.succeeded", "")
+		if err != nil || applied {
+			t.Fatalf("wrong from: applied=%v err=%v", applied, err)
+		}
+		if err := tx.Commit(); err != nil {
+			t.Fatal(err)
+		}
+		inv, err := r.GetInvoice(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if inv.Status != domain.InvoiceApplying || inv.Version != 0 {
+			t.Fatalf("invoice changed: %+v", inv)
+		}
+		assertStateLogs(t, r.db, store.EntityInvoice, id)
+	})
+}
+
+func TestTransitions_ZeroExpectedVersionLeavesStateAndLogUnchanged(t *testing.T) {
+	forEachStore(t, func(t *testing.T, r *testRepo) {
+		ctx := context.Background()
+		id := seedInvoice(t, r)
+		cmd, err := r.InsertCommand(ctx, r.db, id, domain.KindIssue, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		taskID, err := r.InsertTask(ctx, r.db, cmd, id, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entity := range []string{store.EntityInvoice, store.EntityTask} {
+			t.Run(entity, func(t *testing.T) {
+				tx, err := r.db.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				var applied bool
+				if entity == store.EntityInvoice {
+					applied, err = r.TransitionInvoice(ctx, tx, id, domain.InvoiceApplying, domain.InvoiceIssuing, 0, "first", "")
+				} else {
+					applied, err = r.TransitionTask(ctx, tx, taskID, domain.TaskPending, domain.TaskRunning, 0, "first", "")
+				}
+				if err != nil || !applied {
+					t.Fatalf("first move: applied=%v err=%v", applied, err)
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				tx, err = r.db.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer tx.Rollback()
+				if entity == store.EntityInvoice {
+					applied, err = r.TransitionInvoice(ctx, tx, id, domain.InvoiceIssuing, domain.InvoiceIssued, 0, "stale", "")
+				} else {
+					applied, err = r.TransitionTask(ctx, tx, taskID, domain.TaskRunning, domain.TaskWaitingCallback, 0, "stale", "")
+				}
+				if err != nil || applied {
+					t.Fatalf("zero expected version: applied=%v err=%v", applied, err)
+				}
+				if err := tx.Commit(); err != nil {
+					t.Fatal(err)
+				}
+				if entity == store.EntityInvoice {
+					inv, err := r.GetInvoice(ctx, id)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if inv.Status != domain.InvoiceIssuing || inv.Version != 1 {
+						t.Fatalf("invoice changed: %+v", inv)
+					}
+					assertStateLogs(t, r.db, entity, id, stateLog{entity, id, "applying", "issuing", "first", sql.NullString{}})
+				} else {
+					task, err := r.GetTask(ctx, r.db, taskID)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if task.Status != domain.TaskRunning || task.Version != 1 {
+						t.Fatalf("task changed: %+v", task)
+					}
+					assertStateLogs(t, r.db, entity, taskID, stateLog{entity, taskID, "pending", "running", "first", sql.NullString{}})
+				}
+			})
+		}
+	})
 }
 
 func TestTransitionInvoice_VersionMismatch(t *testing.T) {
@@ -94,6 +224,7 @@ func TestTransitionInvoice_AppliedWritesOneStateLogRow(t *testing.T) {
 		if n := stateLogRows(t, r.db, store.EntityInvoice, id); n != 1 {
 			t.Fatalf("state_log rows = %d, want 1", n)
 		}
+		assertStateLogs(t, r.db, store.EntityInvoice, id, stateLog{store.EntityInvoice, id, "applying", "issuing", "provider.task.submitted", sql.NullString{String: "22222222-2222-2222-2222-222222222222", Valid: true}})
 		inv, err := r.GetInvoice(ctx, id)
 		if err != nil {
 			t.Fatal(err)
@@ -229,6 +360,8 @@ func TestTransitions_CallerRollbackRevertsStateAndLog(t *testing.T) {
 				t.Fatalf("logs before rollback=%d", n)
 			}
 		}
+		assertStateLogs(t, tx, store.EntityInvoice, id, stateLog{store.EntityInvoice, id, "applying", "issuing", "provider.task.submitted", sql.NullString{}})
+		assertStateLogs(t, tx, store.EntityTask, taskID, stateLog{store.EntityTask, taskID, "pending", "running", "provider.task.submitted", sql.NullString{}})
 		inv, err := r.GetInvoiceTx(ctx, tx, id)
 		if err != nil {
 			t.Fatal(err)
@@ -306,5 +439,8 @@ func TestTransitionTask_TwoStepChainInOneTx(t *testing.T) {
 		if n := stateLogRows(t, r.db, store.EntityTask, taskID); n != 2 {
 			t.Fatalf("state_log rows = %d, want 2", n)
 		}
+		assertStateLogs(t, r.db, store.EntityTask, taskID,
+			stateLog{store.EntityTask, taskID, "pending", "running", "provider.task.submitted", sql.NullString{String: ev, Valid: true}},
+			stateLog{store.EntityTask, taskID, "running", "waiting_callback", "provider.task.submitted", sql.NullString{String: ev, Valid: true}})
 	})
 }

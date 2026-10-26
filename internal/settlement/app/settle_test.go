@@ -681,3 +681,36 @@ func newRepo(t *testing.T, db *sql.DB, impl string) store.Store {
 	}
 	return store.NewRepo(db)
 }
+
+func TestOnInvoiceDelivered_PersistenceRouting(t *testing.T) {
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			db := testenv.OpenMySQL(t, "settlement")
+			env := deliveredEvent(t, newInvoiceID(), newCustomerID())
+			var handled, inserted int
+			handle := func(ctx context.Context, gotDB *sql.DB, consumer string, got event.Envelope, fn func(*sql.Tx) error) (bool, error) {
+				handled++
+				if gotDB != db || consumer != consumerName || got.EventID != env.EventID {
+					t.Fatal("wrong consume routing arguments")
+				}
+				return consume.ForImplementation(impl)(ctx, gotDB, consumer, got, fn)
+			}
+			insert := func(ctx context.Context, tx *sql.Tx, key string, got event.Envelope) error {
+				inserted++
+				if tx == nil || key != mq.SettlementItemAdded || got.Type != key {
+					t.Fatal("wrong outbox routing arguments")
+				}
+				return outbox.ForImplementation(impl)(ctx, tx, key, got)
+			}
+			svc := NewService(db, newRepo(t, db, impl), newSupplier(t), WithPersistence(handle, insert))
+			callErr := svc.OnInvoiceDelivered(context.Background(), env)
+			if handled != 1 || inserted != 1 {
+				t.Fatalf("handle=%d insert=%d err=%v", handled, inserted, callErr)
+			}
+			if callErr != nil {
+				t.Fatal(callErr)
+			}
+			assertDelivery(t, db, env, "2026-10")
+		})
+	}
+}

@@ -20,6 +20,7 @@ import (
 //
 // A red flush of an invoice that was never issued, or one that runs twice,
 // leaves finance with a negative entry that has no invoice behind it.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) RedFlush(ctx context.Context, invoiceID int64, reason string) (commandID int64, err error) {
 	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
@@ -35,6 +36,7 @@ func (s *Service) RedFlush(ctx context.Context, invoiceID int64, reason string) 
 // If both invoices are live at once the enterprise has claimed the same trip
 // twice; if the old one is red flushed and the new one never issued, the trip
 // has no invoice at all.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Reissue(ctx context.Context, invoiceID int64, reason string) (commandID int64, err error) {
 	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
@@ -50,6 +52,7 @@ func (s *Service) Reissue(ctx context.Context, invoiceID int64, reason string) (
 //
 // A supplement on top of an invoice that was in fact issued puts a duplicate
 // invoice on the books and the customer is invoiced twice for one trip.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Supplement(ctx context.Context, in ApplyInput) (invoiceID, commandID int64, err error) {
 	return 0, 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
@@ -69,6 +72,7 @@ var ErrBizOrderExists = errors.New("biz_order_no already has an invoice")
 // If the replacement is never created the invoice sits in issuing forever; if
 // two live tasks exist, two suppliers are asked at once and the same trip is
 // invoiced twice.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Reopen(ctx context.Context, tx *sql.Tx, invoiceID, commandID, failedTaskID int64) (newTaskID int64, err error) {
 	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
@@ -86,6 +90,7 @@ func (s *Service) Reopen(ctx context.Context, tx *sql.Tx, invoiceID, commandID, 
 //
 // If no replacement appears the employee is left without a valid invoice for
 // a changed trip; if two appear, the enterprise is invoiced twice.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) IssueReplacement(ctx context.Context, tx *sql.Tx, oldInvoiceID, reissueCommandID int64) (newInvoiceID int64, err error) {
 	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }

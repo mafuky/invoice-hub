@@ -4,7 +4,11 @@ package app
 
 import (
 	"context"
+	"database/sql"
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 	"testing"
+	"time"
 
 	"github.com/mafuky/invoice-hub/internal/invoice/domain"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
@@ -54,92 +58,138 @@ func assertCommand(t *testing.T, f *invoiceFixture, id int64, status domain.Comm
 }
 
 func TestEvents_CommandLifecycle_IssueRetryThenSuccess(t *testing.T) {
-	f := seedFixture(t, domain.InvoiceApplying, domain.KindIssue, domain.TaskPending)
-	submitted := sendEvent(t, f, mq.ProviderTaskSubmitted, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	if err := f.events.Handle(context.Background(), submitted); err != nil {
-		t.Fatal(err)
+	forEachPersistence(t, func(t *testing.T, impl string) {
+		f := seedFixture(t, impl, domain.InvoiceApplying, domain.KindIssue, domain.TaskPending)
+		submitted := sendEvent(t, f, mq.ProviderTaskSubmitted, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		if err := f.events.Handle(context.Background(), submitted); err != nil {
+			t.Fatal(err)
+		}
+		sendEvent(t, f, mq.ProviderTaskFailed, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		var next int64
+		if err := f.db.QueryRow(`SELECT id FROM tasks WHERE command_id=? AND status='pending'`, f.cmd).Scan(&next); err != nil {
+			t.Fatal(err)
+		}
+		sendEvent(t, f, mq.ProviderTaskSubmitted, next)
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		// A late success of the failed attempt must not complete this command.
+		sendEvent(t, f, mq.ProviderTaskSucceeded, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		remove := failOutbox(t, f.db)
+		env, err := event.New(mq.ProviderTaskSucceeded, "1", 1, event.TaskOutcome{TaskID: next, InvoiceID: f.inv.ID, InvoiceNo: "AIR-A-12345678"}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.events.Handle(context.Background(), env); err == nil {
+			t.Fatal("outbox failure accepted")
+		}
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		countRows(t, f.db, `SELECT COUNT(*) FROM tasks WHERE id=? AND status='waiting_callback' AND version=2`, 1, next)
+		countRows(t, f.db, `SELECT COUNT(*) FROM invoices WHERE id=? AND status='issuing' AND version=1`, 1, f.inv.ID)
+		countRows(t, f.db, `SELECT COUNT(*) FROM processed_events WHERE event_id=?`, 0, env.EventID)
+		remove()
+		if err := f.events.Handle(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+		assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
+		if err := f.events.Handle(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+		sendEvent(t, f, mq.ProviderTaskSucceeded, next)
+		sendEvent(t, f, mq.ProviderTaskFailed, next)
+		assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
+		countRows(t, f.db, `SELECT COUNT(*) FROM outbox WHERE routing_key=?`, 1, mq.InvoiceIssued)
+
+	})
+}
+
+func TestEvents_PersistenceRouting(t *testing.T) {
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			f := seedFixture(t, impl, domain.InvoiceIssuing, domain.KindIssue, domain.TaskWaitingCallback)
+			db := f.db
+			env, err := event.New(mq.ProviderTaskSucceeded, "1", 1, event.TaskOutcome{TaskID: f.task, InvoiceID: f.inv.ID, InvoiceNo: "AIR-A-12345678"}, "trace-routing")
+			if err != nil {
+				t.Fatal(err)
+			}
+			var handled, inserted int
+			handle := func(ctx context.Context, gotDB *sql.DB, consumer string, got event.Envelope, fn func(*sql.Tx) error) (bool, error) {
+				handled++
+				if gotDB != db || consumer != consumerName || got.EventID != env.EventID {
+					t.Fatal("wrong consume routing arguments")
+				}
+				return consume.ForImplementation(impl)(ctx, gotDB, consumer, got, fn)
+			}
+			insert := func(ctx context.Context, tx *sql.Tx, key string, got event.Envelope) error {
+				inserted++
+				if tx == nil || key != mq.InvoiceIssued || got.Type != key {
+					t.Fatal("wrong outbox routing arguments")
+				}
+				return outbox.ForImplementation(impl)(ctx, tx, key, got)
+			}
+			e := NewEvents(db, f.repo, time.Minute, WithPersistence(handle, insert))
+			callErr := e.Handle(context.Background(), env)
+			if handled != 1 || inserted != 1 {
+				t.Fatalf("handle=%d insert=%d err=%v", handled, inserted, callErr)
+			}
+			if callErr != nil {
+				t.Fatal(callErr)
+			}
+			assertIssuedOutcome(t, f)
+		})
 	}
-	sendEvent(t, f, mq.ProviderTaskFailed, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	var next int64
-	if err := f.db.QueryRow(`SELECT id FROM tasks WHERE command_id=? AND status='pending'`, f.cmd).Scan(&next); err != nil {
-		t.Fatal(err)
-	}
-	sendEvent(t, f, mq.ProviderTaskSubmitted, next)
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	// A late success of the failed attempt must not complete this command.
-	sendEvent(t, f, mq.ProviderTaskSucceeded, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	remove := failOutbox(t, f.db)
-	env, err := event.New(mq.ProviderTaskSucceeded, "1", 1, event.TaskOutcome{TaskID: next, InvoiceID: f.inv.ID, InvoiceNo: "AIR-A-12345678"}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.events.Handle(context.Background(), env); err == nil {
-		t.Fatal("outbox failure accepted")
-	}
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	countRows(t, f.db, `SELECT COUNT(*) FROM tasks WHERE id=? AND status='waiting_callback' AND version=2`, 1, next)
-	countRows(t, f.db, `SELECT COUNT(*) FROM invoices WHERE id=? AND status='issuing' AND version=1`, 1, f.inv.ID)
-	countRows(t, f.db, `SELECT COUNT(*) FROM processed_events WHERE event_id=?`, 0, env.EventID)
-	remove()
-	if err := f.events.Handle(context.Background(), env); err != nil {
-		t.Fatal(err)
-	}
-	assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
-	if err := f.events.Handle(context.Background(), env); err != nil {
-		t.Fatal(err)
-	}
-	sendEvent(t, f, mq.ProviderTaskSucceeded, next)
-	sendEvent(t, f, mq.ProviderTaskFailed, next)
-	assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
-	countRows(t, f.db, `SELECT COUNT(*) FROM outbox WHERE routing_key=?`, 1, mq.InvoiceIssued)
 }
 
 func TestEvents_CommandLifecycle_RedFlushFailure(t *testing.T) {
-	f := seedFixture(t, domain.InvoiceClosed, domain.KindRedFlush, domain.TaskPending)
-	sendEvent(t, f, mq.ProviderTaskSubmitted, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	failed := sendEvent(t, f, mq.ProviderTaskFailed, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandFailed, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskFailed)
-	if err := f.events.Handle(context.Background(), failed); err != nil {
-		t.Fatal(err)
-	}
-	sendEvent(t, f, mq.ProviderTaskFailed, f.task)
-	sendEvent(t, f, mq.ProviderTaskSucceeded, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandFailed, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskFailed)
-	countRows(t, f.db, `SELECT COUNT(*) FROM invoices WHERE id=? AND status='red_flushing'`, 1, f.inv.ID)
-	graphCounts(t, f.db, 1, 1, 1, 0)
+	forEachPersistence(t, func(t *testing.T, impl string) {
+		f := seedFixture(t, impl, domain.InvoiceClosed, domain.KindRedFlush, domain.TaskPending)
+		sendEvent(t, f, mq.ProviderTaskSubmitted, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		failed := sendEvent(t, f, mq.ProviderTaskFailed, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandFailed, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskFailed)
+		if err := f.events.Handle(context.Background(), failed); err != nil {
+			t.Fatal(err)
+		}
+		sendEvent(t, f, mq.ProviderTaskFailed, f.task)
+		sendEvent(t, f, mq.ProviderTaskSucceeded, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandFailed, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskFailed)
+		countRows(t, f.db, `SELECT COUNT(*) FROM invoices WHERE id=? AND status='red_flushing'`, 1, f.inv.ID)
+		graphCounts(t, f.db, 1, 1, 1, 0)
+
+	})
 }
 
 func TestEvents_CommandLifecycle_ReissueReplacementAtomic(t *testing.T) {
-	f := seedFixture(t, domain.InvoiceClosed, domain.KindReissue, domain.TaskPending)
-	sendEvent(t, f, mq.ProviderTaskSubmitted, f.task)
-	remove := failOutbox(t, f.db)
-	env, err := event.New(mq.ProviderTaskSucceeded, "1", 1, event.TaskOutcome{TaskID: f.task, InvoiceID: f.inv.ID}, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := f.events.Handle(context.Background(), env); err == nil {
-		t.Fatal("replacement outbox failure accepted")
-	}
-	assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
-	countRows(t, f.db, `SELECT COUNT(*) FROM tasks WHERE id=? AND status='waiting_callback' AND version=2`, 1, f.task)
-	countRows(t, f.db, `SELECT COUNT(*) FROM invoices WHERE id=? AND status='red_flushing' AND version=1`, 1, f.inv.ID)
-	countRows(t, f.db, `SELECT COUNT(*) FROM processed_events WHERE event_id=?`, 0, env.EventID)
-	remove()
-	graphCounts(t, f.db, 1, 1, 1, 0)
-	if err := f.events.Handle(context.Background(), env); err != nil {
-		t.Fatal(err)
-	}
-	assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
-	countRows(t, f.db, `SELECT COUNT(*) FROM commands WHERE invoice_id<>? AND kind='ISSUE' AND status='created' AND version=0`, 1, f.inv.ID)
-	if err := f.events.Handle(context.Background(), env); err != nil {
-		t.Fatal(err)
-	}
-	sendEvent(t, f, mq.ProviderTaskSucceeded, f.task)
-	sendEvent(t, f, mq.ProviderTaskFailed, f.task)
-	assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
-	graphCounts(t, f.db, 2, 2, 2, 1)
+	forEachPersistence(t, func(t *testing.T, impl string) {
+		f := seedFixture(t, impl, domain.InvoiceClosed, domain.KindReissue, domain.TaskPending)
+		sendEvent(t, f, mq.ProviderTaskSubmitted, f.task)
+		remove := failOutbox(t, f.db)
+		env, err := event.New(mq.ProviderTaskSucceeded, "1", 1, event.TaskOutcome{TaskID: f.task, InvoiceID: f.inv.ID}, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.events.Handle(context.Background(), env); err == nil {
+			t.Fatal("replacement outbox failure accepted")
+		}
+		assertCommand(t, f, f.cmd, domain.CommandDispatched, 1, mq.ProviderTaskSubmitted)
+		countRows(t, f.db, `SELECT COUNT(*) FROM tasks WHERE id=? AND status='waiting_callback' AND version=2`, 1, f.task)
+		countRows(t, f.db, `SELECT COUNT(*) FROM invoices WHERE id=? AND status='red_flushing' AND version=1`, 1, f.inv.ID)
+		countRows(t, f.db, `SELECT COUNT(*) FROM processed_events WHERE event_id=?`, 0, env.EventID)
+		remove()
+		graphCounts(t, f.db, 1, 1, 1, 0)
+		if err := f.events.Handle(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+		assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
+		countRows(t, f.db, `SELECT COUNT(*) FROM commands WHERE invoice_id<>? AND kind='ISSUE' AND status='created' AND version=0`, 1, f.inv.ID)
+		if err := f.events.Handle(context.Background(), env); err != nil {
+			t.Fatal(err)
+		}
+		sendEvent(t, f, mq.ProviderTaskSucceeded, f.task)
+		sendEvent(t, f, mq.ProviderTaskFailed, f.task)
+		assertCommand(t, f, f.cmd, domain.CommandSucceeded, 2, mq.ProviderTaskSubmitted, mq.ProviderTaskSucceeded)
+		graphCounts(t, f.db, 2, 2, 2, 1)
+
+	})
 }

@@ -90,6 +90,7 @@ func ChooseSupplier(line string, exclude []string, suppliers []SupplierInfo) (Su
 // trip and the enterprise pays the tax twice; if the order is placed but the
 // event is lost, the invoice stays in applying and nobody knows which
 // supplier holds it.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (a *ProviderAgent) OnTaskCreated(ctx context.Context, env event.Envelope) error {
 	return fmt.Errorf("lesson 4: %w", errors.ErrUnsupported)
 }

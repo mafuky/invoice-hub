@@ -21,7 +21,7 @@ import (
 
 type invoiceFixture struct {
 	db        *sql.DB
-	repo      *store.Repo
+	repo      store.Store
 	svc       *Service
 	events    *Events
 	inv       domain.Invoice
@@ -37,11 +37,11 @@ func requestInput(t *testing.T) ApplyInput {
 	return ApplyInput{BizOrderNo: testenv.BizOrderNo(), ProductLine: "HOTEL", Title: "Example Travel Co., Ltd.", TaxNo: "91310000EXAMPLE001", Amount: amount, CustomerID: "CUST-0002"}
 }
 
-func seedFixture(t *testing.T, status domain.InvoiceStatus, kind string, taskStatus domain.TaskStatus) *invoiceFixture {
+func seedFixture(t *testing.T, impl string, status domain.InvoiceStatus, kind string, taskStatus domain.TaskStatus) *invoiceFixture {
 	t.Helper()
 	db := testenv.OpenMySQL(t, "invoice")
-	r := store.NewRepo(db)
-	f := &invoiceFixture{db: db, repo: r, svc: NewService(db, r), events: NewEvents(db, r, time.Minute)}
+	r := newRepo(t, db, impl)
+	f := &invoiceFixture{db: db, repo: r, svc: NewService(db, r, persistenceOption(impl)), events: NewEvents(db, r, time.Minute, persistenceOption(impl))}
 	in := requestInput(t)
 	id, err := r.InsertInvoice(context.Background(), db, store.NewInvoice(in))
 	if err != nil {

@@ -11,10 +11,8 @@ import (
 
 	"github.com/mafuky/invoice-hub/internal/invoice/domain"
 	"github.com/mafuky/invoice-hub/internal/invoice/store"
-	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
-	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 )
 
 const consumerName = "invoice-svc"
@@ -194,6 +192,7 @@ func refs(payload []byte) (taskID, invoiceID int64, err error) {
 
 // Events applies supplier, delivery and settlement events to invoices.
 type Events struct {
+	persistence
 	db       *sql.DB
 	repo     store.Store
 	svc      *Service
@@ -203,15 +202,16 @@ type Events struct {
 
 // NewEvents builds the event handler; callbackDeadline is how long a supplier
 // may take to call back before the timeout scanner steps in.
-func NewEvents(db *sql.DB, repo store.Store, callbackDeadline time.Duration) *Events {
-	return &Events{db: db, repo: repo, svc: NewService(db, repo), deadline: callbackDeadline, now: time.Now}
+func NewEvents(db *sql.DB, repo store.Store, callbackDeadline time.Duration, options ...Option) *Events {
+	p := newPersistence(options)
+	return &Events{db: db, repo: repo, svc: &Service{db: db, repo: repo, persistence: p}, deadline: callbackDeadline, now: time.Now, persistence: p}
 }
 
 // Handle is the mq.Handler of q.invoice. A returned error sends the event to
 // the next retry tier, which is how an event that arrives before its
 // predecessor is absorbed.
 func (e *Events) Handle(ctx context.Context, env event.Envelope) error {
-	_, err := consume.Handle(ctx, e.db, consumerName, env, func(tx *sql.Tx) error {
+	_, err := e.handle(ctx, e.db, consumerName, env, func(tx *sql.Tx) error {
 		return e.applyPayload(ctx, tx, env.Type, env.Payload, env.EventID, env.TraceID)
 	})
 	return err
@@ -383,5 +383,5 @@ func (e *Events) emit(ctx context.Context, tx *sql.Tx, p Plan, traceID string) e
 	if err != nil {
 		return err
 	}
-	return outbox.Insert(ctx, tx, p.Emit, out)
+	return e.insert(ctx, tx, p.Emit, out)
 }

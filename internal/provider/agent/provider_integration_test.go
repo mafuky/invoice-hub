@@ -147,3 +147,40 @@ func newRepo(t *testing.T, db *sql.DB, impl string) store.Store {
 	}
 	return store.NewRepo(db)
 }
+
+func TestOnTaskCreated_PersistenceRouting(t *testing.T) {
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			db := testenv.OpenMySQL(t, "provider")
+			mock, _ := countingMock(t)
+			env := taskCreatedEnvelope(t, 501, 301, "FLIGHT")
+			var handled, inserted int
+			handle := func(ctx context.Context, gotDB *sql.DB, consumer string, got event.Envelope, fn func(*sql.Tx) error) (bool, error) {
+				handled++
+				if gotDB != db || consumer != ConsumerName || got.EventID != env.EventID {
+					t.Fatal("wrong consume routing arguments")
+				}
+				return consume.ForImplementation(impl)(ctx, gotDB, consumer, got, fn)
+			}
+			insert := func(ctx context.Context, tx *sql.Tx, key string, got event.Envelope) error {
+				inserted++
+				if tx == nil || key != mq.ProviderTaskSubmitted || got.Type != key {
+					t.Fatal("wrong outbox routing arguments")
+				}
+				return outbox.ForImplementation(impl)(ctx, tx, key, got)
+			}
+			a := NewProviderAgent(db, newRepo(t, db, impl), mock, DefaultSuppliers(), WithPersistence(handle, insert))
+			callErr := a.OnTaskCreated(context.Background(), env)
+			if handled != 1 || inserted != 1 {
+				t.Fatalf("handle=%d insert=%d err=%v", handled, inserted, callErr)
+			}
+			if callErr != nil {
+				t.Fatal(callErr)
+			}
+			var n int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM provider_orders WHERE task_id=501`).Scan(&n); err != nil || n != 1 {
+				t.Fatalf("orders=%d err=%v", n, err)
+			}
+		})
+	}
+}

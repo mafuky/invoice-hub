@@ -106,6 +106,7 @@ func NewHandler(db *sql.DB, repo store.Store, locks Locker, options ...Option) *
 // invoice is marked failed and a second supplier issues it again, so the
 // enterprise is billed twice; if a busy order is answered as a duplicate, the
 // supplier stops retrying and the invoice stays in issuing.
+// Contract: persistence must use the injected insert field and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (h *Handler) Handle(ctx context.Context, cb Callback) (Result, error) {
 	return 0, fmt.Errorf("lesson 5: %w", errors.ErrUnsupported)
 }

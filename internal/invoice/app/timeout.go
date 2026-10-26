@@ -46,6 +46,7 @@ func NewScanner(db *sql.DB, repo store.Store, provider providerv1.ProviderServic
 // If a lost callback is treated as "not issued", a second supplier issues the
 // same trip and the enterprise pays tax twice; if the task is never retried,
 // the invoice stays in issuing forever.
+// Contract: persistence must use the repo and Events/Service injected handle/insert fields, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Scanner) RunOnce(ctx context.Context) (handled int, err error) {
 	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }

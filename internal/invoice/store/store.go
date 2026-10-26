@@ -10,6 +10,15 @@ import (
 
 // Store is the persistence boundary used by invoice application and gRPC handlers.
 type Store interface {
+	GetInvoiceByBizOrderNo(context.Context, DBTX, string) (domain.Invoice, error)
+	InsertInvoice(context.Context, DBTX, NewInvoice) (int64, error)
+	InsertCommand(context.Context, DBTX, int64, string, string) (int64, error)
+	InsertTask(context.Context, DBTX, int64, int64, string) (int64, error)
+	GetTask(context.Context, DBTX, int64) (domain.Task, error)
+	GetCommand(context.Context, DBTX, int64) (domain.Command, error)
+	ListTimedOutTasks(context.Context, time.Time, int) ([]domain.Task, error)
+	ListCommandsForUpdate(context.Context, *sql.Tx, int64) ([]domain.Command, error)
+	ListTasksForUpdate(context.Context, *sql.Tx, int64) ([]domain.Task, error)
 	GetInvoice(context.Context, int64) (domain.Invoice, error)
 	GetInvoiceTx(context.Context, DBTX, int64) (domain.Invoice, error)
 	GetInvoiceForUpdate(context.Context, *sql.Tx, int64) (domain.Invoice, error)

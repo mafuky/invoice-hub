@@ -61,6 +61,7 @@ func NewService(db *sql.DB, repo store.Store, verifier Verifier, options ...Opti
 // If the same delivered invoice is added twice, the customer is charged twice
 // for one trip and the supplier is paid twice. Adding to a statement that has
 // left pending_settle silently changes an already reviewed or paid total.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) OnInvoiceDelivered(ctx context.Context, env event.Envelope) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }
@@ -74,6 +75,7 @@ func (s *Service) OnInvoiceDelivered(ctx context.Context, env event.Envelope) er
 //
 // A stale total, or one calculated on a statement already under review, means
 // the customer is billed for a different sum than the items show.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Calculate(ctx context.Context, id int64) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }
@@ -84,6 +86,7 @@ func (s *Service) Calculate(ctx context.Context, id int64) error {
 //
 // A statement submitted before it was calculated reaches the reviewer with no
 // total to check.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) SubmitReview(ctx context.Context, id int64) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }
@@ -95,6 +98,7 @@ func (s *Service) SubmitReview(ctx context.Context, id int64) error {
 //
 // An approval that applies twice or from the wrong state lets a statement go
 // to payment without a review.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Approve(ctx context.Context, id int64) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }
@@ -108,6 +112,7 @@ func (s *Service) Approve(ctx context.Context, id int64) error {
 //
 // If a rejected statement cannot be recalculated, finance has to delete it
 // and rebuild it, and the history of what was wrong is lost.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Reject(ctx context.Context, id int64, reason string) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }
@@ -118,6 +123,7 @@ func (s *Service) Reject(ctx context.Context, id int64, reason string) error {
 // settlement is final; paying twice is refused.
 //
 // Paying twice sends the same money to the supplier twice.
+// Contract: persistence must use the injected handle/insert fields and repo, never consume.Handle/outbox.Insert directly; the configured store implementation selects them.
 func (s *Service) Pay(ctx context.Context, id int64) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
 }

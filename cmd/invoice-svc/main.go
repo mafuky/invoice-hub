@@ -28,6 +28,7 @@ import (
 	"github.com/mafuky/invoice-hub/internal/invoice/store"
 	"github.com/mafuky/invoice-hub/internal/invoice/store/gormstore"
 	"github.com/mafuky/invoice-hub/internal/platform/config"
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/dial"
 	"github.com/mafuky/invoice-hub/internal/platform/logx"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
@@ -88,7 +89,8 @@ func run(mode string, log *slog.Logger) error {
 			return err
 		}
 	}
-	events := app.NewEvents(db, repo, cfg.CallbackDeadline)
+	persistence := app.WithPersistence(consume.ForImplementation(cfg.StoreImpl), outbox.ForImplementation(cfg.StoreImpl))
+	events := app.NewEvents(db, repo, cfg.CallbackDeadline, persistence)
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -106,7 +108,7 @@ func run(mode string, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", cfg.InvoiceAddr, err)
 		}
-		gs = invoicegrpc.NewGRPCServer(invoicegrpc.NewServer(app.NewService(db, repo), repo))
+		gs = invoicegrpc.NewGRPCServer(invoicegrpc.NewServer(app.NewService(db, repo, persistence), repo))
 		log.Info("listening " + cfg.InvoiceAddr)
 		loops.start(runCtx, "grpc", func() error { return gs.Serve(lis) })
 
@@ -124,7 +126,7 @@ func run(mode string, log *slog.Logger) error {
 			return err
 		}
 		defer pub.Close()
-		relay := outbox.NewRelay(db, pub, "invoice")
+		relay := outbox.NewRelayForImplementation(db, pub, "invoice", cfg.StoreImpl)
 		loops.start(runCtx, "relay", func() error { return relay.Run(runCtx) })
 	}
 
