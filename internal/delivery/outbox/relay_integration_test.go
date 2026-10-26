@@ -7,6 +7,7 @@ import (
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/mafuky/invoice-hub/internal/delivery/store/storetest"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
+	platform "github.com/mafuky/invoice-hub/internal/platform/outbox"
 )
 
 type recordingPub struct {
@@ -84,12 +86,14 @@ func TestRelay_FailedPublishKeepsRowPendingAndBacksOff(t *testing.T) {
 	queue(t, repo, 1)
 
 	relay := outbox.NewRelay(repo.OutboxCollection(), &recordingPub{fail: errors.New("broker nacked")}, "delivery")
+	before := time.Now()
 	if n, err := relay.RunOnce(ctx); err == nil || n != 0 {
 		t.Fatalf("RunOnce = %d, %v; want 0 and an error", n, err)
 	}
 	var row struct {
-		Status   string `bson:"status"`
-		Attempts int    `bson:"attempts"`
+		Status        string    `bson:"status"`
+		Attempts      int       `bson:"attempts"`
+		NextAttemptAt time.Time `bson:"next_attempt_at"`
 	}
 	if err := repo.OutboxCollection().FindOne(ctx, bson.D{}).Decode(&row); err != nil {
 		t.Fatal(err)
@@ -97,8 +101,17 @@ func TestRelay_FailedPublishKeepsRowPendingAndBacksOff(t *testing.T) {
 	if row.Status != "pending" || row.Attempts != 1 {
 		t.Fatalf("row = %+v, want pending with 1 attempt", row)
 	}
+	// Mongo stores milliseconds, so allow for the truncation.
+	if earliest := before.Add(platform.Backoff(1) - time.Millisecond); row.NextAttemptAt.Before(earliest) {
+		t.Fatalf("next attempt at %v, want no earlier than %v", row.NextAttemptAt, earliest)
+	}
 
-	// Backed off: an immediate second pass finds nothing due.
+	// Over a slow link the backoff may run out before the next query lands, so the
+	// second pass only proves something with time to spare.
+	if time.Until(row.NextAttemptAt) < time.Second {
+		t.Log("backoff nearly over; second pass not checked")
+		return
+	}
 	good := &recordingPub{}
 	if n, err := outbox.NewRelay(repo.OutboxCollection(), good, "delivery").RunOnce(ctx); err != nil || n != 0 || len(good.ids) != 0 {
 		t.Fatalf("second pass = %d, %v, published %d; want nothing", n, err, len(good.ids))
