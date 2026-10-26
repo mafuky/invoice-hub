@@ -79,12 +79,17 @@ LESSON_TESTS_9 := internal/invoice/app/commands_test.go internal/invoice/app/tim
 # and exclude ordinary integration tests in packages that also contain lessons.
 test-lesson:
 	@test -n "$(LESSON_PACKAGES_$(N))" || { echo 'usage: make test-lesson N=1..9' >&2; exit 2; }
-	@set -eu; for pkg in $(LESSON_PACKAGES_$(N)); do \
+	@case "$(IMPL)" in ''|sql|gorm) ;; *) echo 'IMPL must be sql or gorm' >&2; exit 2 ;; esac
+	@test -z "$(IMPL)" || test "$(N)" = 1 || { echo 'IMPL is supported for lesson 1 only' >&2; exit 2; }
+	@set -eu; result=0; for pkg in $(LESSON_PACKAGES_$(N)); do \
+		if test -n "$(IMPL)" && test "$$pkg" != internal/invoice/store; then continue; fi; \
 		set --; \
 		for file in $(LESSON_TESTS_$(N)); do \
 			case "$$file" in "$$pkg/"*) set -- "$$@" "$$file" ;; esac; \
 		done; \
 		tests=$$(sed -n 's/^func \(Test[[:alnum:]_]*\)[[:space:]]*(.*/\1/p' "$$@" | paste -sd '|' -); \
 		test -n "$$tests" || { echo "no lesson tests found for $$pkg" >&2; exit 2; }; \
-		go test -p 1 -count=1 -tags 'lesson integration' -run "^($$tests)$$" "./$$pkg"; \
-	done
+		run="^($$tests)$$"; \
+		if test -n "$(IMPL)"; then run="$$run/^$(IMPL)$$"; fi; \
+		go test -v -p 1 -count=1 -tags 'lesson integration' -run "$$run" "./$$pkg" || result=1; \
+	done; exit $$result

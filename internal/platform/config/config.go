@@ -17,6 +17,8 @@ import (
 )
 
 type Config struct {
+	StoreImpl string
+
 	SSHHost   string
 	SSHPort   string
 	SSHUser   string
@@ -129,6 +131,7 @@ func Load() (Config, error) {
 	mc := src.mock()
 
 	c := Config{
+		StoreImpl: get("INVHUB_STORE_IMPL", "sql", false),
 		SSHHost:   get("INVHUB_SSH_HOST", "", false),
 		SSHPort:   get("INVHUB_SSH_PORT", "", false),
 		SSHUser:   get("INVHUB_SSH_USER", "", false),
@@ -156,6 +159,9 @@ func Load() (Config, error) {
 	}
 	if len(src.missing) > 0 {
 		return Config{}, fmt.Errorf("config: missing required keys: %s", strings.Join(src.missing, ", "))
+	}
+	if c.StoreImpl != "sql" && c.StoreImpl != "gorm" {
+		return Config{}, errors.New("config: INVHUB_STORE_IMPL must be sql or gorm")
 	}
 	c.CallbackDeadline = defaultCallbackDeadline
 	if v := get("INVHUB_CALLBACK_DEADLINE", "", false); v != "" {
@@ -276,6 +282,7 @@ func redactSecret(s string) string {
 
 func (c Config) redacted() []slog.Attr {
 	return []slog.Attr{
+		slog.String("store_impl", c.StoreImpl),
 		slog.String("ssh_host", c.SSHHost),
 		slog.String("ssh_port", c.SSHPort),
 		slog.String("ssh_user", c.SSHUser),

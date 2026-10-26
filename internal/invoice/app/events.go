@@ -195,7 +195,7 @@ func refs(payload []byte) (taskID, invoiceID int64, err error) {
 // Events applies supplier, delivery and settlement events to invoices.
 type Events struct {
 	db       *sql.DB
-	repo     *store.Repo
+	repo     store.Store
 	svc      *Service
 	deadline time.Duration
 	now      func() time.Time
@@ -203,7 +203,7 @@ type Events struct {
 
 // NewEvents builds the event handler; callbackDeadline is how long a supplier
 // may take to call back before the timeout scanner steps in.
-func NewEvents(db *sql.DB, repo *store.Repo, callbackDeadline time.Duration) *Events {
+func NewEvents(db *sql.DB, repo store.Store, callbackDeadline time.Duration) *Events {
 	return &Events{db: db, repo: repo, svc: NewService(db, repo), deadline: callbackDeadline, now: time.Now}
 }
 

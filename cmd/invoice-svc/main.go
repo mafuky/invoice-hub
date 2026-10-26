@@ -26,6 +26,7 @@ import (
 	"github.com/mafuky/invoice-hub/internal/invoice/app"
 	invoicegrpc "github.com/mafuky/invoice-hub/internal/invoice/grpc"
 	"github.com/mafuky/invoice-hub/internal/invoice/store"
+	"github.com/mafuky/invoice-hub/internal/invoice/store/gormstore"
 	"github.com/mafuky/invoice-hub/internal/platform/config"
 	"github.com/mafuky/invoice-hub/internal/platform/dial"
 	"github.com/mafuky/invoice-hub/internal/platform/logx"
@@ -80,7 +81,13 @@ func run(mode string, log *slog.Logger) error {
 	}
 	log.Info("queues declared")
 
-	repo := store.NewRepo(db)
+	var repo store.Store = store.NewRepo(db)
+	if cfg.StoreImpl == "gorm" {
+		repo, err = gormstore.NewRepo(db)
+		if err != nil {
+			return err
+		}
+	}
 	events := app.NewEvents(db, repo, cfg.CallbackDeadline)
 
 	runCtx, cancel := context.WithCancel(ctx)

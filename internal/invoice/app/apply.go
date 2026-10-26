@@ -27,10 +27,10 @@ type ApplyInput struct {
 // Service implements the invoice commands.
 type Service struct {
 	db   *sql.DB
-	repo *store.Repo
+	repo store.Store
 }
 
-func NewService(db *sql.DB, repo *store.Repo) *Service {
+func NewService(db *sql.DB, repo store.Store) *Service {
 	return &Service{db: db, repo: repo}
 }
 

@@ -17,13 +17,13 @@ import (
 // Scanner recovers tasks whose supplier never called back.
 type Scanner struct {
 	db       *sql.DB
-	repo     *store.Repo
+	repo     store.Store
 	provider providerv1.ProviderServiceClient
 	events   *Events
 	now      func() time.Time
 }
 
-func NewScanner(db *sql.DB, repo *store.Repo, provider providerv1.ProviderServiceClient, events *Events) *Scanner {
+func NewScanner(db *sql.DB, repo store.Store, provider providerv1.ProviderServiceClient, events *Events) *Scanner {
 	return &Scanner{db: db, repo: repo, provider: provider, events: events, now: time.Now}
 }
 
