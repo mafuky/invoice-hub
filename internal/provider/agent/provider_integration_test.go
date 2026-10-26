@@ -4,6 +4,7 @@ package agent
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -11,12 +12,15 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
 	"github.com/mafuky/invoice-hub/internal/platform/money"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 	"github.com/mafuky/invoice-hub/internal/platform/testenv"
 	"github.com/mafuky/invoice-hub/internal/provider/client"
 	"github.com/mafuky/invoice-hub/internal/provider/store"
+	"github.com/mafuky/invoice-hub/internal/provider/store/gormstore"
 )
 
 func taskCreatedEnvelope(t *testing.T, taskID, invoiceID int64, line string) event.Envelope {
@@ -52,70 +56,94 @@ func countingMock(t *testing.T) (*client.Mock, *atomic.Int32) {
 }
 
 func TestOnTaskCreated_DuplicateEventOrdersOnce(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "provider")
-	mock, orders := countingMock(t)
-	a := NewProviderAgent(db, store.NewRepo(db), mock, DefaultSuppliers())
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			ctx := context.Background()
+			db := testenv.OpenMySQL(t, "provider")
+			mock, orders := countingMock(t)
+			a := NewProviderAgent(db, newRepo(t, db, impl), mock, DefaultSuppliers(), WithPersistence(consume.ForImplementation(impl), outbox.ForImplementation(impl)))
 
-	env := taskCreatedEnvelope(t, 501, 301, "FLIGHT")
-	for i := 0; i < 2; i++ {
-		if err := a.OnTaskCreated(ctx, env); err != nil {
-			t.Fatalf("delivery %d: %v", i+1, err)
-		}
-	}
+			env := taskCreatedEnvelope(t, 501, 301, "FLIGHT")
+			for i := 0; i < 2; i++ {
+				if err := a.OnTaskCreated(ctx, env); err != nil {
+					t.Fatalf("delivery %d: %v", i+1, err)
+				}
+			}
 
-	if n := orders.Load(); n != 1 {
-		t.Fatalf("supplier received %d orders, want 1", n)
-	}
-	var rows int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM provider_orders WHERE task_id = 501`).Scan(&rows); err != nil || rows != 1 {
-		t.Fatalf("provider_orders rows = %d (err %v), want 1", rows, err)
-	}
-	var submitted int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE routing_key = ?`, mq.ProviderTaskSubmitted).Scan(&submitted); err != nil || submitted != 1 {
-		t.Fatalf("submitted events = %d (err %v), want 1", submitted, err)
+			if n := orders.Load(); n != 1 {
+				t.Fatalf("supplier received %d orders, want 1", n)
+			}
+			var rows int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM provider_orders WHERE task_id = 501`).Scan(&rows); err != nil || rows != 1 {
+				t.Fatalf("provider_orders rows = %d (err %v), want 1", rows, err)
+			}
+			var submitted int
+			if err := db.QueryRow(`SELECT COUNT(*) FROM outbox WHERE routing_key = ?`, mq.ProviderTaskSubmitted).Scan(&submitted); err != nil || submitted != 1 {
+				t.Fatalf("submitted events = %d (err %v), want 1", submitted, err)
+			}
+		})
 	}
 }
 
 func TestOnTaskCreated_ReplacementTaskAvoidsFailedSupplier(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "provider")
-	repo := store.NewRepo(db)
-	mock, _ := countingMock(t)
-	a := NewProviderAgent(db, repo, mock, DefaultSuppliers())
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			ctx := context.Background()
+			db := testenv.OpenMySQL(t, "provider")
+			repo := newRepo(t, db, impl)
+			mock, _ := countingMock(t)
+			a := NewProviderAgent(db, repo, mock, DefaultSuppliers(), WithPersistence(consume.ForImplementation(impl), outbox.ForImplementation(impl)))
 
-	if _, err := repo.InsertOrder(ctx, db, store.NewOrder{TaskID: 601, InvoiceID: 401, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-900001"}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := db.ExecContext(ctx, `UPDATE provider_orders SET status = ? WHERE task_id = 601`, store.StatusFailed); err != nil {
-		t.Fatal(err)
-	}
+			if _, err := repo.InsertOrder(ctx, db, store.NewOrder{TaskID: 601, InvoiceID: 401, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-900001"}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.ExecContext(ctx, `UPDATE provider_orders SET status = ? WHERE task_id = 601`, store.StatusFailed); err != nil {
+				t.Fatal(err)
+			}
 
-	if err := a.OnTaskCreated(ctx, taskCreatedEnvelope(t, 602, 401, "FLIGHT")); err != nil {
-		t.Fatal(err)
-	}
-	var supplier string
-	if err := db.QueryRow(`SELECT supplier FROM provider_orders WHERE task_id = 602`).Scan(&supplier); err != nil || supplier != "backup" {
-		t.Fatalf("replacement task went to %q (err %v), want backup", supplier, err)
+			if err := a.OnTaskCreated(ctx, taskCreatedEnvelope(t, 602, 401, "FLIGHT")); err != nil {
+				t.Fatal(err)
+			}
+			var supplier string
+			if err := db.QueryRow(`SELECT supplier FROM provider_orders WHERE task_id = 602`).Scan(&supplier); err != nil || supplier != "backup" {
+				t.Fatalf("replacement task went to %q (err %v), want backup", supplier, err)
+			}
+		})
 	}
 }
 
 func TestOnTaskCreated_OlderSubmittedOrderIsExcluded(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "provider")
-	repo := store.NewRepo(db)
-	mock, _ := countingMock(t)
-	a := NewProviderAgent(db, repo, mock, DefaultSuppliers())
+	for _, impl := range []string{"sql", "gorm"} {
+		t.Run(impl, func(t *testing.T) {
+			ctx := context.Background()
+			db := testenv.OpenMySQL(t, "provider")
+			repo := newRepo(t, db, impl)
+			mock, _ := countingMock(t)
+			a := NewProviderAgent(db, repo, mock, DefaultSuppliers(), WithPersistence(consume.ForImplementation(impl), outbox.ForImplementation(impl)))
 
-	// Task 701 was ordered at air-a and never answered; task 702 replaced it.
-	if _, err := repo.InsertOrder(ctx, db, store.NewOrder{TaskID: 701, InvoiceID: 411, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-900002"}); err != nil {
-		t.Fatal(err)
+			// Task 701 was ordered at air-a and never answered; task 702 replaced it.
+			if _, err := repo.InsertOrder(ctx, db, store.NewOrder{TaskID: 701, InvoiceID: 411, Supplier: "air-a", SupplierOrderNo: "AIR-A-ORD-900002"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := a.OnTaskCreated(ctx, taskCreatedEnvelope(t, 702, 411, "FLIGHT")); err != nil {
+				t.Fatal(err)
+			}
+			var supplier string
+			if err := db.QueryRow(`SELECT supplier FROM provider_orders WHERE task_id = 702`).Scan(&supplier); err != nil || supplier != "backup" {
+				t.Fatalf("replacement task went to %q (err %v), want backup", supplier, err)
+			}
+		})
 	}
-	if err := a.OnTaskCreated(ctx, taskCreatedEnvelope(t, 702, 411, "FLIGHT")); err != nil {
-		t.Fatal(err)
+}
+
+func newRepo(t *testing.T, db *sql.DB, impl string) store.Store {
+	t.Helper()
+	if impl == "gorm" {
+		repo, err := gormstore.NewRepo(db)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return repo
 	}
-	var supplier string
-	if err := db.QueryRow(`SELECT supplier FROM provider_orders WHERE task_id = 702`).Scan(&supplier); err != nil || supplier != "backup" {
-		t.Fatalf("replacement task went to %q (err %v), want backup", supplier, err)
-	}
+	return store.NewRepo(db)
 }

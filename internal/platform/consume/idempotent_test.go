@@ -52,99 +52,117 @@ func assertEffects(t *testing.T, db *sql.DB, env event.Envelope, want int) {
 }
 
 func TestHandle_FnFailureRollsBackEffectsAndMarker(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "invoice")
-	env := deliveredEnvelope(t)
-	boom := errors.New("business write failed")
-	dup, err := Handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error {
-		if err := writeEffects(ctx, tx, env); err != nil {
-			return err
+	forEachImplementation(t, func(t *testing.T, handle func(context.Context, *sql.DB, string, event.Envelope, func(*sql.Tx) error) (bool, error)) {
+		ctx := context.Background()
+		db := testenv.OpenMySQL(t, "invoice")
+		env := deliveredEnvelope(t)
+		boom := errors.New("business write failed")
+		dup, err := handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error {
+			if err := writeEffects(ctx, tx, env); err != nil {
+				return err
+			}
+			return boom
+		})
+		if dup || !errors.Is(err, boom) {
+			t.Fatalf("duplicate=%v err=%v", dup, err)
 		}
-		return boom
+		assertEffects(t, db, env, 0)
+		dup, err = handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error { return writeEffects(ctx, tx, env) })
+		if dup || err != nil {
+			t.Fatalf("retry duplicate=%v err=%v", dup, err)
+		}
+		assertEffects(t, db, env, 1)
 	})
-	if dup || !errors.Is(err, boom) {
-		t.Fatalf("duplicate=%v err=%v", dup, err)
-	}
-	assertEffects(t, db, env, 0)
-	dup, err = Handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error { return writeEffects(ctx, tx, env) })
-	if dup || err != nil {
-		t.Fatalf("retry duplicate=%v err=%v", dup, err)
-	}
-	assertEffects(t, db, env, 1)
 }
 
 func TestHandle_ConcurrentDuplicateAppliesOnce(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "invoice")
-	env := deliveredEnvelope(t)
-	const n = 10
-	dups := make([]bool, n)
-	errs := make([]error, n)
-	start := make(chan struct{})
-	var wg sync.WaitGroup
-	for i := range n {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			<-start
-			dups[i], errs[i] = Handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error { return writeEffects(ctx, tx, env) })
-		}()
-	}
-	close(start)
-	wg.Wait()
-	first := 0
-	for i, err := range errs {
-		if err != nil {
-			t.Fatal(err)
+	forEachImplementation(t, func(t *testing.T, handle func(context.Context, *sql.DB, string, event.Envelope, func(*sql.Tx) error) (bool, error)) {
+		ctx := context.Background()
+		db := testenv.OpenMySQL(t, "invoice")
+		env := deliveredEnvelope(t)
+		const n = 10
+		dups := make([]bool, n)
+		errs := make([]error, n)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range n {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				dups[i], errs[i] = handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error { return writeEffects(ctx, tx, env) })
+			}()
 		}
-		if !dups[i] {
-			first++
+		close(start)
+		wg.Wait()
+		first := 0
+		for i, err := range errs {
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !dups[i] {
+				first++
+			}
 		}
-	}
-	if first != 1 {
-		t.Fatalf("nonduplicates=%d", first)
-	}
-	assertEffects(t, db, env, 1)
+		if first != 1 {
+			t.Fatalf("nonduplicates=%d", first)
+		}
+		assertEffects(t, db, env, 1)
+	})
 }
 
 func TestHandle_DuplicateSkipsFn(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "invoice")
-	env := deliveredEnvelope(t)
+	forEachImplementation(t, func(t *testing.T, handle func(context.Context, *sql.DB, string, event.Envelope, func(*sql.Tx) error) (bool, error)) {
+		ctx := context.Background()
+		db := testenv.OpenMySQL(t, "invoice")
+		env := deliveredEnvelope(t)
 
-	calls := 0
-	fn := func(*sql.Tx) error { calls++; return nil }
+		calls := 0
+		fn := func(*sql.Tx) error { calls++; return nil }
 
-	dup, err := Handle(ctx, db, "invoice-svc", env, fn)
-	if err != nil || dup {
-		t.Fatalf("first delivery: duplicate=%v err=%v", dup, err)
-	}
-	dup, err = Handle(ctx, db, "invoice-svc", env, fn)
-	if err != nil {
-		t.Fatalf("second delivery: %v", err)
-	}
-	if !dup {
-		t.Fatal("second delivery of the same event_id was not reported as duplicate")
-	}
-	if calls != 1 {
-		t.Fatalf("fn ran %d times, want 1", calls)
-	}
+		dup, err := handle(ctx, db, "invoice-svc", env, fn)
+		if err != nil || dup {
+			t.Fatalf("first delivery: duplicate=%v err=%v", dup, err)
+		}
+		dup, err = handle(ctx, db, "invoice-svc", env, fn)
+		if err != nil {
+			t.Fatalf("second delivery: %v", err)
+		}
+		if !dup {
+			t.Fatal("second delivery of the same event_id was not reported as duplicate")
+		}
+		if calls != 1 {
+			t.Fatalf("fn ran %d times, want 1", calls)
+		}
+	})
 }
 
 func TestHandle_FnFailsThenRedelivered_RunsAgain(t *testing.T) {
-	ctx := context.Background()
-	db := testenv.OpenMySQL(t, "invoice")
-	env := deliveredEnvelope(t)
+	forEachImplementation(t, func(t *testing.T, handle func(context.Context, *sql.DB, string, event.Envelope, func(*sql.Tx) error) (bool, error)) {
+		ctx := context.Background()
+		db := testenv.OpenMySQL(t, "invoice")
+		env := deliveredEnvelope(t)
 
-	boom := errors.New("out of order, invoice still issuing")
-	dup, err := Handle(ctx, db, "invoice-svc", env, func(*sql.Tx) error { return boom })
-	if !errors.Is(err, boom) || dup {
-		t.Fatalf("failing fn: duplicate=%v err=%v", dup, err)
-	}
+		boom := errors.New("out of order, invoice still issuing")
+		dup, err := handle(ctx, db, "invoice-svc", env, func(*sql.Tx) error { return boom })
+		if !errors.Is(err, boom) || dup {
+			t.Fatalf("failing fn: duplicate=%v err=%v", dup, err)
+		}
 
-	calls := 0
-	dup, err = Handle(ctx, db, "invoice-svc", env, func(*sql.Tx) error { calls++; return nil })
-	if err != nil || dup || calls != 1 {
-		t.Fatalf("redelivery after failure: duplicate=%v err=%v calls=%d", dup, err, calls)
+		calls := 0
+		dup, err = handle(ctx, db, "invoice-svc", env, func(*sql.Tx) error { calls++; return nil })
+		if err != nil || dup || calls != 1 {
+			t.Fatalf("redelivery after failure: duplicate=%v err=%v calls=%d", dup, err, calls)
+		}
+	})
+}
+
+func forEachImplementation(t *testing.T, test func(*testing.T, func(context.Context, *sql.DB, string, event.Envelope, func(*sql.Tx) error) (bool, error))) {
+	t.Helper()
+	for _, impl := range []struct {
+		name string
+		run  func(context.Context, *sql.DB, string, event.Envelope, func(*sql.Tx) error) (bool, error)
+	}{{"sql", ForImplementation("sql")}, {"gorm", ForImplementation("gorm")}} {
+		t.Run(impl.name, func(t *testing.T) { test(t, impl.run) })
 	}
 }

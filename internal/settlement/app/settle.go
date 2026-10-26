@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 	"github.com/mafuky/invoice-hub/internal/settlement/store"
 	"github.com/mafuky/invoice-hub/internal/settlement/verify"
 )
@@ -26,14 +28,20 @@ type Verifier interface {
 
 // Service implements the settlement use cases.
 type Service struct {
+	handle   consume.Handler
+	insert   outbox.Inserter
 	db       *sql.DB
-	repo     *store.Repo
+	repo     store.Store
 	verifier Verifier
 	now      func() time.Time
 }
 
-func NewService(db *sql.DB, repo *store.Repo, verifier Verifier) *Service {
-	return &Service{db: db, repo: repo, verifier: verifier, now: time.Now}
+func NewService(db *sql.DB, repo store.Store, verifier Verifier, options ...Option) *Service {
+	s := &Service{db: db, repo: repo, verifier: verifier, now: time.Now, handle: consume.Handle, insert: outbox.Insert}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
 // OnInvoiceDelivered is the handler of invoice.invoice.delivered events: it
@@ -112,4 +120,12 @@ func (s *Service) Reject(ctx context.Context, id int64, reason string) error {
 // Paying twice sends the same money to the supplier twice.
 func (s *Service) Pay(ctx context.Context, id int64) error {
 	return fmt.Errorf("lesson 7: %w", errors.ErrUnsupported)
+}
+
+// Option configures the service's persistence helpers before it starts.
+type Option func(*Service)
+
+// WithPersistence binds event handling and event writes to the selected store implementation.
+func WithPersistence(handle consume.Handler, insert outbox.Inserter) Option {
+	return func(s *Service) { s.handle = handle; s.insert = insert }
 }

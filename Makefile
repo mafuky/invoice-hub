@@ -80,11 +80,12 @@ LESSON_TESTS_9 := internal/invoice/app/commands_test.go internal/invoice/app/tim
 test-lesson:
 	@test -n "$(LESSON_PACKAGES_$(N))" || { echo 'usage: make test-lesson N=1..9' >&2; exit 2; }
 	@case "$(IMPL)" in ''|sql|gorm) ;; *) echo 'IMPL must be sql or gorm' >&2; exit 2 ;; esac
-	@test -z "$(IMPL)" || test "$(N)" = 1 || { echo 'IMPL is supported for lesson 1 only' >&2; exit 2; }
+	@if test -n "$(IMPL)"; then case "$(N)" in 1|2|3|4|5|7) ;; *) echo 'IMPL is supported for lessons 1, 2, 3, 4, 5 and 7' >&2; exit 2 ;; esac; fi
 	@set -eu; result=0; for pkg in $(LESSON_PACKAGES_$(N)); do \
-		if test -n "$(IMPL)" && test "$$pkg" != internal/invoice/store; then continue; fi; \
+		if test -n "$(IMPL)"; then case "$$pkg" in internal/invoice/store|internal/platform/outbox|internal/platform/consume|internal/provider/agent|internal/provider/callback|internal/settlement/app) ;; *) continue ;; esac; fi; \
 		set --; \
 		for file in $(LESSON_TESTS_$(N)); do \
+			if test -n "$(IMPL)" && test "$$file" = internal/provider/agent/provider_test.go; then continue; fi; \
 			case "$$file" in "$$pkg/"*) set -- "$$@" "$$file" ;; esac; \
 		done; \
 		tests=$$(sed -n 's/^func \(Test[[:alnum:]_]*\)[[:space:]]*(.*/\1/p' "$$@" | paste -sd '|' -); \

@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/mafuky/invoice-hub/internal/platform/config"
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/dial"
 	"github.com/mafuky/invoice-hub/internal/platform/logx"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
@@ -33,6 +34,7 @@ import (
 	providergrpc "github.com/mafuky/invoice-hub/internal/provider/grpc"
 	"github.com/mafuky/invoice-hub/internal/provider/lock"
 	"github.com/mafuky/invoice-hub/internal/provider/store"
+	"github.com/mafuky/invoice-hub/internal/provider/store/gormstore"
 )
 
 const (
@@ -95,9 +97,15 @@ func run(mode string, log *slog.Logger) error {
 	}
 	log.Info("queues declared")
 
-	repo := store.NewRepo(db)
+	var repo store.Store = store.NewRepo(db)
+	if cfg.StoreImpl == "gorm" {
+		repo, err = gormstore.NewRepo(db)
+		if err != nil {
+			return err
+		}
+	}
 	mock := client.NewMock(cfg.MockURL)
-	provider := agent.NewProviderAgent(db, repo, mock, agent.DefaultSuppliers())
+	provider := agent.NewProviderAgent(db, repo, mock, agent.DefaultSuppliers(), agent.WithPersistence(consume.ForImplementation(cfg.StoreImpl), outbox.ForImplementation(cfg.StoreImpl)))
 
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -109,7 +117,7 @@ func run(mode string, log *slog.Logger) error {
 		if err != nil {
 			return fmt.Errorf("listen %s: %w", cfg.ProviderAddr, err)
 		}
-		handler := callback.NewHandler(db, repo, lock.New(rdb))
+		handler := callback.NewHandler(db, repo, lock.New(rdb), callback.WithPersistence(outbox.ForImplementation(cfg.StoreImpl)))
 		raw := store.NewRawCallbacks(mongoDB.Collection("callbacks"))
 		gs = providergrpc.NewGRPCServer(providergrpc.NewServer(handler, raw, repo, mock))
 		log.Info("listening " + cfg.ProviderAddr)
@@ -126,7 +134,7 @@ func run(mode string, log *slog.Logger) error {
 			return err
 		}
 		defer pub.Close()
-		relay := outbox.NewRelay(db, pub, "provider")
+		relay := outbox.NewRelayForImplementation(db, pub, "provider", cfg.StoreImpl)
 		loops.start(runCtx, "relay", func() error { return relay.Run(runCtx) })
 	}
 

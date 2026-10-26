@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 	"github.com/mafuky/invoice-hub/internal/provider/store"
 )
 
@@ -70,13 +71,18 @@ type Locker interface {
 
 // Handler applies callbacks to provider orders.
 type Handler struct {
-	db    *sql.DB
-	repo  *store.Repo
-	locks Locker
+	insert outbox.Inserter
+	db     *sql.DB
+	repo   store.Store
+	locks  Locker
 }
 
-func NewHandler(db *sql.DB, repo *store.Repo, locks Locker) *Handler {
-	return &Handler{db: db, repo: repo, locks: locks}
+func NewHandler(db *sql.DB, repo store.Store, locks Locker, options ...Option) *Handler {
+	s := &Handler{db: db, repo: repo, locks: locks, insert: outbox.Insert}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
 // Handle applies one supplier callback to the provider order it names and, when
@@ -102,4 +108,12 @@ func NewHandler(db *sql.DB, repo *store.Repo, locks Locker) *Handler {
 // supplier stops retrying and the invoice stays in issuing.
 func (h *Handler) Handle(ctx context.Context, cb Callback) (Result, error) {
 	return 0, fmt.Errorf("lesson 5: %w", errors.ErrUnsupported)
+}
+
+// Option configures the service's persistence helpers before it starts.
+type Option func(*Handler)
+
+// WithPersistence binds event writes to the selected store implementation.
+func WithPersistence(insert outbox.Inserter) Option {
+	return func(s *Handler) { s.insert = insert }
 }

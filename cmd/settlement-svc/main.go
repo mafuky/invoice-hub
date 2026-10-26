@@ -22,6 +22,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/mafuky/invoice-hub/internal/platform/config"
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/dial"
 	"github.com/mafuky/invoice-hub/internal/platform/logx"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
@@ -30,6 +31,7 @@ import (
 	"github.com/mafuky/invoice-hub/internal/settlement/app"
 	settlementgrpc "github.com/mafuky/invoice-hub/internal/settlement/grpc"
 	"github.com/mafuky/invoice-hub/internal/settlement/store"
+	"github.com/mafuky/invoice-hub/internal/settlement/store/gormstore"
 	"github.com/mafuky/invoice-hub/internal/settlement/verify"
 )
 
@@ -78,8 +80,14 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("queues declared")
 
-	repo := store.NewRepo(db)
-	svc := app.NewService(db, repo, verify.NewClient(cfg.MockURL, cfg.DeliveryTimeout))
+	var repo store.Store = store.NewRepo(db)
+	if cfg.StoreImpl == "gorm" {
+		repo, err = gormstore.NewRepo(db)
+		if err != nil {
+			return err
+		}
+	}
+	svc := app.NewService(db, repo, verify.NewClient(cfg.MockURL, cfg.DeliveryTimeout), app.WithPersistence(consume.ForImplementation(cfg.StoreImpl), outbox.ForImplementation(cfg.StoreImpl)))
 
 	lis, err := net.Listen("tcp", cfg.SettlementAddr)
 	if err != nil {
@@ -102,7 +110,7 @@ func run(log *slog.Logger) error {
 	loops.start(runCtx, "consume", func() error {
 		return mq.Consume(runCtx, conn, mq.QueueSettlement, consumePrefetch, svc.OnInvoiceDelivered)
 	})
-	relay := outbox.NewRelay(db, pub, "settlement")
+	relay := outbox.NewRelayForImplementation(db, pub, "settlement", cfg.StoreImpl)
 	loops.start(runCtx, "relay", func() error { return relay.Run(runCtx) })
 
 	runErr := waitForLoop(ctx, loops.errc)

@@ -305,3 +305,13 @@ func (r *Repo) ListItems(ctx context.Context, settlementID int64) ([]Item, error
 	}
 	return out, rows.Err()
 }
+
+// HasItem checks whether an invoice already belongs to a statement before re-verifying it.
+func (r *Repo) HasItem(ctx context.Context, q DBTX, invoiceID int64) (bool, error) {
+	var exists bool
+	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM settlement_items WHERE invoice_id = ?)`, invoiceID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("store: find item for invoice %d: %w", invoiceID, err)
+	}
+	return exists, nil
+}

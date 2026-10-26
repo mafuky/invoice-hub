@@ -9,7 +9,9 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/mafuky/invoice-hub/internal/platform/consume"
 	"github.com/mafuky/invoice-hub/internal/platform/event"
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 	"github.com/mafuky/invoice-hub/internal/provider/client"
 	"github.com/mafuky/invoice-hub/internal/provider/store"
 )
@@ -44,14 +46,20 @@ type Orderer interface {
 
 // ProviderAgent places supplier orders for new tasks.
 type ProviderAgent struct {
+	handle    consume.Handler
+	insert    outbox.Inserter
 	db        *sql.DB
-	repo      *store.Repo
+	repo      store.Store
 	orders    Orderer
 	suppliers []SupplierInfo
 }
 
-func NewProviderAgent(db *sql.DB, repo *store.Repo, orders Orderer, suppliers []SupplierInfo) *ProviderAgent {
-	return &ProviderAgent{db: db, repo: repo, orders: orders, suppliers: suppliers}
+func NewProviderAgent(db *sql.DB, repo store.Store, orders Orderer, suppliers []SupplierInfo, options ...Option) *ProviderAgent {
+	s := &ProviderAgent{db: db, repo: repo, orders: orders, suppliers: suppliers, handle: consume.Handle, insert: outbox.Insert}
+	for _, option := range options {
+		option(s)
+	}
+	return s
 }
 
 // ChooseSupplier picks the supplier for one invoice line: the first in the list
@@ -84,4 +92,12 @@ func ChooseSupplier(line string, exclude []string, suppliers []SupplierInfo) (Su
 // supplier holds it.
 func (a *ProviderAgent) OnTaskCreated(ctx context.Context, env event.Envelope) error {
 	return fmt.Errorf("lesson 4: %w", errors.ErrUnsupported)
+}
+
+// Option configures the service's persistence helpers before it starts.
+type Option func(*ProviderAgent)
+
+// WithPersistence binds event handling and event writes to the selected store implementation.
+func WithPersistence(handle consume.Handler, insert outbox.Inserter) Option {
+	return func(s *ProviderAgent) { s.handle = handle; s.insert = insert }
 }

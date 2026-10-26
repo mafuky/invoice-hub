@@ -68,6 +68,10 @@ func (r *Relay) RunOnce(ctx context.Context) (sent int, err error) {
 // Run polls the outbox until ctx is cancelled. It returns an error when the
 // publisher's channel is closed, because the process must then restart.
 func (r *Relay) Run(ctx context.Context) error {
+	return r.run(ctx, r.RunOnce)
+}
+
+func (r *Relay) run(ctx context.Context, runOnce func(context.Context) (int, error)) error {
 	wait := time.Duration(0)
 	failures := 0
 	for {
@@ -76,7 +80,7 @@ func (r *Relay) Run(ctx context.Context) error {
 			return nil
 		case <-time.After(wait):
 		}
-		n, err := r.RunOnce(ctx)
+		n, err := runOnce(ctx)
 		switch {
 		case err == nil:
 			failures = 0
