@@ -18,6 +18,7 @@ func TestConfig_RedactionHandlesCredentialDelimiters(t *testing.T) {
 		{"encoded", "app:plain-secret@tcp(localhost:3306)/invoice", "mongodb://app:encoded%3Fsecret%40tail@localhost/db?authMechanismProperties=query-secret", []string{"plain-secret", "encoded%3Fsecret%40tail", "encoded?secret@tail", "query-secret"}},
 		{"malformed", "app:broken-secret", "mongodb://app:broken-secret%zz@localhost/?token=query-secret", []string{"broken-secret", "query-secret"}},
 		{"ambiguous_uri", "app:plain-secret@tcp(localhost:3306)/invoice", "mongodb://app:question-secret?tail@localhost/db", []string{"plain-secret", "question-secret"}},
+		{"numeric_prefix", "app:plain-secret@tcp(localhost:3306)/invoice", "mongodb://app:12345?tail@localhost/db", []string{"plain-secret", "12345"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := Config{MySQLDSNInvoice: tc.dsn, MySQLDSNProvider: tc.dsn, MySQLDSNSettlement: tc.dsn, MongoURI: tc.uri, AMQPURL: tc.uri}

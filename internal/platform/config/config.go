@@ -241,6 +241,11 @@ func redactURL(s string) string {
 	if err != nil || u.Scheme == "" || u.Host == "" || u.Opaque != "" {
 		return "***"
 	}
+	// An '@' the parser did not read as userinfo means the credentials were
+	// split somewhere else (for example "app:12345?x@host" parses 12345 as a port).
+	if u.User == nil && strings.Contains(s, "@") {
+		return "***"
+	}
 	u.User = nil
 	u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
 	u.ForceQuery = false
