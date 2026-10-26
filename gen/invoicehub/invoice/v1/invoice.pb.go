@@ -369,6 +369,7 @@ func (x *ListReply) GetNextPageToken() string {
 	return ""
 }
 
+// Accepted only for a closed invoice; other states are refused with no writes.
 type RedFlushRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InvoiceId     int64                  `protobuf:"varint,1,opt,name=invoice_id,json=invoiceId,proto3" json:"invoice_id,omitempty"`
@@ -421,6 +422,8 @@ func (x *RedFlushRequest) GetReason() string {
 	return ""
 }
 
+// Accepted only for a closed invoice; other states are refused with no writes.
+// The replacement reuses the existing invoice details.
 type ReissueRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	InvoiceId     int64                  `protobuf:"varint,1,opt,name=invoice_id,json=invoiceId,proto3" json:"invoice_id,omitempty"`

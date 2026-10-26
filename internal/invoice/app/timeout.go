@@ -29,12 +29,15 @@ func NewScanner(db *sql.DB, repo *store.Repo, provider providerv1.ProviderServic
 
 // RunOnce handles the tasks that are waiting_callback past their deadline. For
 // each it asks the supplier, through provider-svc QueryOrder, whether the
-// invoice was issued. A found result must be applied through
+// invoice was issued. Only terminal found outcomes (SUCCEEDED or FAILED) go through
 // Events.ApplyOutcome, so the task move, the invoice move, invoice_no and the
 // issued event commit in one transaction exactly as a callback's would. If
 // the supplier has no such order, the task is marked failed and the
 // replacement must be created through Service.Reopen, in the same
 // transaction, so provider-svc picks the next supplier.
+// PENDING and query errors leave the task unchanged and never reopen it.
+// A callback may complete while a query is in flight; its committed outcome
+// takes precedence over the query result.
 //
 // Invariant: an order the supplier has already issued is never reordered, and a
 // timed-out order the supplier does not know is retried exactly once per

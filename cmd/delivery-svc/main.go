@@ -107,25 +107,24 @@ func run(log *slog.Logger) error {
 
 	srv := &http.Server{Handler: healthMux(), ReadHeaderTimeout: 5 * time.Second}
 	log.Info("listening " + cfg.DeliveryAddr)
-	loops.start("http", func() error {
+	loops.start(runCtx, "http", func() error {
 		if err := srv.Serve(lis); !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
 	})
-	loops.start("consume", func() error {
+	loops.start(runCtx, "consume", func() error {
 		return mq.Consume(runCtx, conn, mq.QueueDelivery, consumePrefetch, deliveries.OnInvoiceIssued)
 	})
-	loops.start("worker", func() error { return deliveries.Run(runCtx, workerInterval) })
-	loops.start("scan", func() error { return scanner.Run(runCtx, scanInterval, cfg.DeliveryStuckAfter) })
-	loops.start("relay", func() error { return relay.Run(runCtx) })
+	loops.start(runCtx, "worker", func() error { return deliveries.Run(runCtx, workerInterval) })
+	loops.start(runCtx, "scan", func() error { return scanner.Run(runCtx, scanInterval, cfg.DeliveryStuckAfter) })
+	loops.start(runCtx, "relay", func() error { return relay.Run(runCtx) })
 
-	var runErr error
-	select {
-	case <-ctx.Done():
-		log.Info("shutting down")
-	case runErr = <-loops.errc:
+	runErr := waitForLoop(ctx, loops.errc)
+	if runErr != nil {
 		log.Error("background loop failed, shutting down", "err", runErr)
+	} else {
+		log.Info("shutting down")
 	}
 
 	cancel()
@@ -149,6 +148,23 @@ func healthMux() *http.ServeMux {
 	return mux
 }
 
+func waitForLoop(ctx context.Context, errc <-chan error) error {
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return nil
+	case err := <-errc:
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
+	}
+}
+
 // loopGroup runs background loops and reports the first one that fails.
 // A loop that returns nil before shutdown counts as a failure too.
 type loopGroup struct {
@@ -156,15 +172,19 @@ type loopGroup struct {
 	errc chan error
 }
 
-func (g *loopGroup) start(name string, fn func() error) {
+func (g *loopGroup) start(ctx context.Context, name string, fn func() error) {
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
 		err := fn()
+		if ctx.Err() != nil {
+			return
+		}
 		if err == nil {
 			err = errors.New("stopped unexpectedly")
 		}
 		select {
+		case <-ctx.Done():
 		case g.errc <- fmt.Errorf("%s: %w", name, err):
 		default:
 		}

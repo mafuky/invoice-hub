@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/go-sql-driver/mysql"
 )
 
 type Config struct {
@@ -229,25 +232,34 @@ func parseEnvFile(path string) (map[string]string, error) {
 	return out, sc.Err()
 }
 
-// redactURL masks the password and drops the query of a DSN or URI.
+// redactURL removes URI credentials and query parameters before logging.
 func redactURL(s string) string {
 	if s == "" {
 		return ""
 	}
-	scheme := ""
-	rest := s
-	if i := strings.Index(s, "://"); i >= 0 {
-		scheme, rest = s[:i+3], s[i+3:]
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme == "" || u.Host == "" || u.Opaque != "" {
+		return "***"
 	}
-	if i := strings.IndexByte(rest, '?'); i >= 0 {
-		rest = rest[:i]
+	u.User = nil
+	u.RawQuery, u.Fragment, u.RawFragment = "", "", ""
+	u.ForceQuery = false
+	return u.String()
+}
+
+func redactDSN(s string) string {
+	if s == "" {
+		return ""
 	}
-	at := strings.LastIndexByte(rest, '@')
-	if at < 0 {
-		return scheme + rest
+	c, err := mysql.ParseDSN(s)
+	if err != nil {
+		return "***"
 	}
-	user, _, _ := strings.Cut(rest[:at], ":")
-	return scheme + user + ":***@" + rest[at+1:]
+	// Only retain the destination; driver options may contain credentials too.
+	safe := mysql.NewConfig()
+	safe.User, safe.Passwd = c.User, "***"
+	safe.Net, safe.Addr, safe.DBName = c.Net, c.Addr, c.DBName
+	return safe.FormatDSN()
 }
 
 func redactSecret(s string) string {
@@ -263,9 +275,9 @@ func (c Config) redacted() []slog.Attr {
 		slog.String("ssh_port", c.SSHPort),
 		slog.String("ssh_user", c.SSHUser),
 		slog.String("remote_dir", c.RemoteDir),
-		slog.String("mysql_dsn_invoice", redactURL(c.MySQLDSNInvoice)),
-		slog.String("mysql_dsn_provider", redactURL(c.MySQLDSNProvider)),
-		slog.String("mysql_dsn_settlement", redactURL(c.MySQLDSNSettlement)),
+		slog.String("mysql_dsn_invoice", redactDSN(c.MySQLDSNInvoice)),
+		slog.String("mysql_dsn_provider", redactDSN(c.MySQLDSNProvider)),
+		slog.String("mysql_dsn_settlement", redactDSN(c.MySQLDSNSettlement)),
 		slog.String("redis_addr", c.RedisAddr),
 		slog.String("redis_password", redactSecret(c.RedisPassword)),
 		slog.String("amqp_url", redactURL(c.AMQPURL)),

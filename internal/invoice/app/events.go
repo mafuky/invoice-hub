@@ -81,7 +81,7 @@ func PlanFor(routingKey string, payload []byte, invoiceStatus domain.InvoiceStat
 			}
 		case isRedKind(kind):
 			if invoiceStatus != domain.InvoiceRedFlushing {
-				plan.InvoiceFrom, plan.InvoiceTo = domain.InvoiceIssued, domain.InvoiceRedFlushing
+				plan.InvoiceFrom, plan.InvoiceTo = domain.InvoiceClosed, domain.InvoiceRedFlushing
 			}
 		default:
 			return Plan{}, fmt.Errorf("%s for task %d: unknown command kind %q", routingKey, p.TaskID, kind)
@@ -246,7 +246,7 @@ func (e *Events) applyPayload(ctx context.Context, tx *sql.Tx, key string, paylo
 		if task, err = e.repo.GetTaskForUpdate(ctx, tx, taskID); err != nil {
 			return err
 		}
-		cmd, err := e.repo.GetCommand(ctx, tx, task.CommandID)
+		cmd, err := e.repo.GetCommandForUpdate(ctx, tx, task.CommandID)
 		if err != nil {
 			return err
 		}
@@ -292,6 +292,30 @@ func (e *Events) execute(ctx context.Context, tx *sql.Tx, p Plan, task domain.Ta
 			return fmt.Errorf("task %d is not %s at version %d, %s arrived out of order", p.TaskID, st.From, version, key)
 		}
 		version++
+	}
+	if p.TaskID != 0 {
+		cmd, err := e.repo.GetCommandForUpdate(ctx, tx, task.CommandID)
+		if err != nil {
+			return err
+		}
+		var to domain.CommandStatus
+		switch {
+		case key == mq.ProviderTaskSubmitted && cmd.Status == domain.CommandCreated:
+			to = domain.CommandDispatched
+		case key == mq.ProviderTaskSucceeded:
+			to = domain.CommandSucceeded
+		case key == mq.ProviderTaskFailed && isRedKind(cmd.Kind):
+			to = domain.CommandFailed
+		}
+		if to != "" {
+			ok, err := e.repo.TransitionCommand(ctx, tx, cmd.ID, cmd.Status, to, cmd.Version, key, eventID)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("command %d changed while applying %s", cmd.ID, key)
+			}
+		}
 	}
 	if p.Reopen {
 		if _, err := e.svc.Reopen(ctx, tx, p.InvoiceID, task.CommandID, p.TaskID); err != nil {

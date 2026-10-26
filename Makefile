@@ -73,7 +73,7 @@ LESSON_TESTS_5 := internal/provider/callback/handle_test.go
 LESSON_TESTS_6 := internal/delivery/agent/deliver_test.go internal/delivery/agent/deliver_integration_test.go internal/delivery/scan/recover_test.go
 LESSON_TESTS_7 := internal/settlement/domain/canto_test.go internal/settlement/app/settle_test.go
 LESSON_TESTS_8 := internal/settlement/verify/rules_test.go
-LESSON_TESTS_9 := internal/invoice/app/commands_test.go internal/invoice/app/timeout_test.go
+LESSON_TESTS_9 := internal/invoice/app/commands_test.go internal/invoice/app/timeout_test.go internal/invoice/app/command_lifecycle_test.go
 
 # File lists keep Apply (lesson 2) separate from commands/timeout (lesson 9),
 # and exclude ordinary integration tests in packages that also contain lessons.

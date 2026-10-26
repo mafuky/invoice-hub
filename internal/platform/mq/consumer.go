@@ -184,6 +184,10 @@ func settle(ctx context.Context, log *slog.Logger, relay *relayState, d amqp.Del
 			_ = d.Nack(false, true)
 			return fmt.Errorf("mq: %s returned unroutable (%d %s), original requeued", target, r.ReplyCode, r.ReplyText)
 		}
+		if relay.ch.IsClosed() {
+			_ = d.Nack(false, true)
+			return fmt.Errorf("mq: relay channel closed while moving %s: %w", d.MessageId, amqp.ErrClosed)
+		}
 		if aerr := d.Ack(false); aerr != nil {
 			log.ErrorContext(ctx, "ack after move failed", "message_id", d.MessageId, "err", aerr)
 		}

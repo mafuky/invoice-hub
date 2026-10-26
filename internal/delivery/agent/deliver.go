@@ -50,9 +50,10 @@ func NewDeliveryAgent(repo *store.Repo, senders map[string]Sender) *DeliveryAgen
 // NextRetry is the wait before a failed push of an invoice is tried again,
 // where attempt counts the failed pushes so far, starting at 1.
 //
-// Invariant: the wait grows with attempts until it reaches max, never exceeds
-// max, and differs between deliveries that failed together; the same random
-// source gives the same waits.
+// For attempt >= 1, base >= 2ns, max >= base and a non-nil random source,
+// cap = min(max, base*2^(attempt-1)) and the delay is in [cap/2, cap).
+// The same random source state gives the same waits; jitter spreads retries
+// from deliveries that failed together.
 //
 // If every failed delivery retries at the same instant, a customer endpoint
 // that has just recovered is flooded by all of them at once and goes down

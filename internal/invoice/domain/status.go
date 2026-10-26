@@ -49,8 +49,9 @@ const (
 var InvoiceTransitions = map[InvoiceStatus][]InvoiceStatus{
 	InvoiceApplying:    {InvoiceIssuing},
 	InvoiceIssuing:     {InvoiceIssued, InvoiceFailed},
-	InvoiceIssued:      {InvoiceDelivered, InvoiceRedFlushing},
+	InvoiceIssued:      {InvoiceDelivered},
 	InvoiceDelivered:   {InvoiceClosed},
+	InvoiceClosed:      {InvoiceRedFlushing},
 	InvoiceRedFlushing: {InvoiceRedFlushed},
 }
 

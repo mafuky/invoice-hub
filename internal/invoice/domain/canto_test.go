@@ -13,7 +13,8 @@ func TestCanTo_InvoiceTable(t *testing.T) {
 		{InvoiceIssuing, InvoiceIssued, true},
 		{InvoiceIssuing, InvoiceFailed, true},
 		{InvoiceIssued, InvoiceDelivered, true},
-		{InvoiceIssued, InvoiceRedFlushing, true},
+		{InvoiceIssued, InvoiceRedFlushing, false},
+		{InvoiceClosed, InvoiceRedFlushing, true},
 		{InvoiceDelivered, InvoiceClosed, true},
 		{InvoiceRedFlushing, InvoiceRedFlushed, true},
 		{InvoiceDelivered, InvoiceIssuing, false},
@@ -32,8 +33,8 @@ func TestCanTo_InvoiceTable(t *testing.T) {
 		}
 	}
 	for _, from := range []InvoiceStatus{InvoiceApplying, InvoiceIssuing, InvoiceIssued, InvoiceDelivered, InvoiceClosed, InvoiceRedFlushing, InvoiceRedFlushed, InvoiceFailed} {
-		if InvoiceClosed.CanTo(from) {
-			t.Errorf("closed invoice must not move to %s", from)
+		if InvoiceRedFlushed.CanTo(from) {
+			t.Errorf("red flushed invoice must not move to %s", from)
 		}
 	}
 }

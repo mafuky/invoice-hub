@@ -4,36 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/url"
 	"time"
 
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 	"go.mongodb.org/mongo-driver/v2/mongo/readpref"
-
-	"github.com/mafuky/invoice-hub/internal/platform/dial"
 )
 
-// OpenMongo checks reachability, connects and pings with a 5s timeout.
+// OpenMongo connects using the driver's URI handling and pings with a 5s timeout.
 func OpenMongo(ctx context.Context, uri, db string) (*mongo.Database, error) {
-	u, err := url.Parse(uri)
-	if err != nil || u.Host == "" {
-		return nil, fmt.Errorf("store: invalid mongo uri")
-	}
-	if err := dial.Check(u.Host, 5*time.Second, tunnelHint); err != nil {
-		return nil, fmt.Errorf("store: mongo: %w", err)
-	}
+	return openMongo(ctx, uri, db, func(uri string) (*mongo.Client, error) {
+		return mongo.Connect(options.Client().ApplyURI(uri))
+	})
+}
 
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+func openMongo(ctx context.Context, uri, db string, connect func(string) (*mongo.Client, error)) (*mongo.Database, error) {
+	client, err := connect(uri)
 	if err != nil {
-		return nil, fmt.Errorf("store: connect mongo %s: connect failed", u.Host)
+		return nil, fmt.Errorf("store: connect mongo failed; check URI settings and %s", tunnelHint)
 	}
 	pctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	if err := client.Ping(pctx, readpref.Primary()); err != nil {
-		_ = client.Disconnect(context.Background())
-		return nil, fmt.Errorf("store: ping mongo %s: %w", u.Host, err)
+		dctx, disconnectCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer disconnectCancel()
+		_ = client.Disconnect(dctx)
+		return nil, fmt.Errorf("store: ping mongo failed; check connectivity and %s", tunnelHint)
 	}
 	return client.Database(db), nil
 }

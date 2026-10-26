@@ -118,6 +118,134 @@ func TestTransitionInvoice_IllegalJump_Refused(t *testing.T) {
 	if n := stateLogRows(t, tx, EntityInvoice, id); n != 0 {
 		t.Fatalf("state_log has %d rows for a refused jump", n)
 	}
+	inv, err := r.GetInvoiceTx(ctx, tx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.Status != domain.InvoiceApplying || inv.Version != 0 {
+		t.Fatalf("refused jump changed invoice: %+v", inv)
+	}
+}
+
+func taskRefusal(t *testing.T, current, from, to domain.TaskStatus, version int, illegal bool) {
+	t.Helper()
+	ctx := context.Background()
+	r := NewRepo(testenv.OpenMySQL(t, "invoice"))
+	invoiceID := seedInvoice(t, r)
+	cmd, err := r.InsertCommand(ctx, r.db, invoiceID, domain.KindIssue, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := r.InsertTask(ctx, r.db, cmd, invoiceID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.db.Exec(`UPDATE tasks SET status=? WHERE id=?`, current, id); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	ok, err := r.TransitionTask(ctx, tx, id, from, to, version, "provider.task.succeeded", "")
+	if ok {
+		t.Fatal("refused task transition applied")
+	}
+	if !illegal && err != nil {
+		t.Fatal(err)
+	}
+	task, err := r.GetTask(ctx, tx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task.Status != current || task.Version != 0 {
+		t.Fatalf("changed task: %+v", task)
+	}
+	if n := stateLogRows(t, tx, EntityTask, id); n != 0 {
+		t.Fatalf("refused transition logs=%d", n)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransitionTask_StaleVersionLeavesStateAndLogUnchanged(t *testing.T) {
+	taskRefusal(t, domain.TaskPending, domain.TaskPending, domain.TaskRunning, 7, false)
+}
+func TestTransitionTask_WrongFromLeavesStateAndLogUnchanged(t *testing.T) {
+	taskRefusal(t, domain.TaskPending, domain.TaskRunning, domain.TaskWaitingCallback, 0, false)
+}
+func TestTransitionTask_TerminalAndIllegalMovesRefused(t *testing.T) {
+	for _, tc := range []struct{ from, to domain.TaskStatus }{{domain.TaskDone, domain.TaskFailed}, {domain.TaskFailed, domain.TaskDone}, {domain.TaskPending, domain.TaskDone}} {
+		t.Run(string(tc.from)+" to "+string(tc.to), func(t *testing.T) { taskRefusal(t, tc.from, tc.from, tc.to, 0, true) })
+	}
+}
+
+func TestTransitions_CallerRollbackRevertsStateAndLog(t *testing.T) {
+	ctx := context.Background()
+	r := NewRepo(testenv.OpenMySQL(t, "invoice"))
+	id := seedInvoice(t, r)
+	cmd, err := r.InsertCommand(ctx, r.db, id, domain.KindIssue, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskID, err := r.InsertTask(ctx, r.db, cmd, id, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if ok, err := r.TransitionInvoice(ctx, tx, id, domain.InvoiceApplying, domain.InvoiceIssuing, 0, "provider.task.submitted", ""); err != nil || !ok {
+		t.Fatalf("invoice: %v %v", ok, err)
+	}
+	if ok, err := r.TransitionTask(ctx, tx, taskID, domain.TaskPending, domain.TaskRunning, 0, "provider.task.submitted", ""); err != nil || !ok {
+		t.Fatalf("task: %v %v", ok, err)
+	}
+	for _, x := range []struct {
+		entity string
+		id     int64
+	}{{EntityInvoice, id}, {EntityTask, taskID}} {
+		if n := stateLogRows(t, tx, x.entity, x.id); n != 1 {
+			t.Fatalf("logs before rollback=%d", n)
+		}
+	}
+	inv, err := r.GetInvoiceTx(ctx, tx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := r.GetTask(ctx, tx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.Status != domain.InvoiceIssuing || inv.Version != 1 || task.Status != domain.TaskRunning || task.Version != 1 {
+		t.Fatal("transitions missing inside tx")
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	inv, err = r.GetInvoice(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err = r.GetTask(ctx, r.db, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inv.Status != domain.InvoiceApplying || inv.Version != 0 || task.Status != domain.TaskPending || task.Version != 0 {
+		t.Fatalf("survived rollback: %+v %+v", inv, task)
+	}
+	for _, x := range []struct {
+		entity string
+		id     int64
+	}{{EntityInvoice, id}, {EntityTask, taskID}} {
+		if n := stateLogRows(t, r.db, x.entity, x.id); n != 0 {
+			t.Fatalf("logs after rollback=%d", n)
+		}
+	}
 }
 
 func TestTransitionTask_TwoStepChainInOneTx(t *testing.T) {

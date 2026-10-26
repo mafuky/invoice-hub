@@ -80,6 +80,44 @@ func TestApply_ConcurrentSameBizOrderNo_OneInvoice(t *testing.T) {
 	if events != 1 {
 		t.Errorf("task created events = %d, want 1", events)
 	}
+	countRows(t, db, `SELECT COUNT(*) FROM commands WHERE invoice_id=?`, 1, results[0].id)
+	countRows(t, db, `SELECT COUNT(*) FROM tasks WHERE invoice_id=?`, 1, results[0].id)
+}
+
+func TestApply_OutboxFailureRollsBackInvoiceCommandAndTask(t *testing.T) {
+	db := testenv.OpenMySQL(t, "invoice")
+	svc := NewService(db, store.NewRepo(db))
+	restore := failOutbox(t, db)
+	if _, _, err := svc.Apply(context.Background(), requestInput(t)); err == nil {
+		t.Fatal("outbox failure accepted")
+	}
+	restore()
+	graphCounts(t, db, 0, 0, 0, 0)
+}
+
+func TestApply_TaskCreatedPayloadMatchesPersistedGraph(t *testing.T) {
+	db := testenv.OpenMySQL(t, "invoice")
+	r := store.NewRepo(db)
+	svc := NewService(db, r)
+	in := requestInput(t)
+	id, existed, err := svc.Apply(context.Background(), in)
+	if err != nil || existed {
+		t.Fatalf("existed=%v err=%v", existed, err)
+	}
+	inv, err := r.GetInvoice(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertFields(t, inv, in)
+	if inv.Status != "applying" {
+		t.Fatalf("status=%s", inv.Status)
+	}
+	var cmd int64
+	if err := db.QueryRow(`SELECT id FROM commands WHERE invoice_id=?`, id).Scan(&cmd); err != nil {
+		t.Fatal(err)
+	}
+	assertPendingGraph(t, &invoiceFixture{db: db, repo: r}, id, cmd, "ISSUE", "")
+	graphCounts(t, db, 1, 1, 1, 1)
 }
 
 func TestApply_NewRequest_CreatesCommandPendingTaskAndEvent(t *testing.T) {

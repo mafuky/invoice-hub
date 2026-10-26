@@ -101,6 +101,9 @@ func (s *supplier) sleep(d time.Duration) bool {
 	}
 }
 
+// createOrder exposes a pending order before injected latency or failure finishes.
+// A concurrent duplicate may receive an order number later forgotten on a 5xx;
+// timeout recovery queries the supplier and reopens the attempt if it is missing.
 func (s *supplier) createOrder(w http.ResponseWriter, r *http.Request) {
 	var req orderReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

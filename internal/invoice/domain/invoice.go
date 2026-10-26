@@ -27,6 +27,7 @@ type Command struct {
 	Kind      string
 	Status    CommandStatus
 	Reason    string
+	Version   int
 }
 
 type Task struct {

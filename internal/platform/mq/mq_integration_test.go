@@ -4,6 +4,7 @@ package mq
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
@@ -112,6 +113,28 @@ func TestPublish_WaitsForConfirm(t *testing.T) {
 	}
 	if msg.DeliveryMode != amqp.Persistent {
 		t.Fatalf("delivery mode %d, want persistent", msg.DeliveryMode)
+	}
+}
+
+func TestPublisher_ClosedChannelReturnsErrClosed(t *testing.T) {
+	conn := dialOrSkip(t)
+	pub, err := NewPublisher(conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pub.Close(); err != nil {
+		t.Fatal(err)
+	}
+	env := newEnvelope(t)
+	done := make(chan error, 1)
+	go func() { done <- pub.Publish(context.Background(), InvoiceTaskCreated, env) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, amqp.ErrClosed) {
+			t.Fatalf("Publish = %v, want ErrClosed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Publish did not return promptly after channel closure")
 	}
 }
 

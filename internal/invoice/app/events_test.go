@@ -73,10 +73,10 @@ func TestEvents_MapsRoutingKeysToTransitions(t *testing.T) {
 		},
 		{
 			"red flush order accepted",
-			mq.ProviderTaskSubmitted, submitted, domain.InvoiceIssued, domain.KindRedFlush, "",
+			mq.ProviderTaskSubmitted, submitted, domain.InvoiceClosed, domain.KindRedFlush, "",
 			Plan{
 				TaskID: 11, InvoiceID: 7, TaskSteps: toWaiting, SetDeadline: true,
-				InvoiceFrom: domain.InvoiceIssued, InvoiceTo: domain.InvoiceRedFlushing,
+				InvoiceFrom: domain.InvoiceClosed, InvoiceTo: domain.InvoiceRedFlushing,
 			},
 		},
 		{
@@ -100,10 +100,10 @@ func TestEvents_MapsRoutingKeysToTransitions(t *testing.T) {
 		},
 		{
 			"reissue order accepted takes the red flush path",
-			mq.ProviderTaskSubmitted, submitted, domain.InvoiceIssued, domain.KindReissue, "",
+			mq.ProviderTaskSubmitted, submitted, domain.InvoiceClosed, domain.KindReissue, "",
 			Plan{
 				TaskID: 11, InvoiceID: 7, TaskSteps: toWaiting, SetDeadline: true,
-				InvoiceFrom: domain.InvoiceIssued, InvoiceTo: domain.InvoiceRedFlushing,
+				InvoiceFrom: domain.InvoiceClosed, InvoiceTo: domain.InvoiceRedFlushing,
 			},
 		},
 		{

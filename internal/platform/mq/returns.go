@@ -6,7 +6,10 @@ import amqp "github.com/rabbitmq/amqp091-go"
 func drainReturns(ch <-chan amqp.Return) {
 	for {
 		select {
-		case <-ch:
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
 		default:
 			return
 		}
@@ -17,7 +20,10 @@ func drainReturns(ch <-chan amqp.Return) {
 func findReturn(ch <-chan amqp.Return, messageID string) (amqp.Return, bool) {
 	for {
 		select {
-		case r := <-ch:
+		case r, ok := <-ch:
+			if !ok {
+				return amqp.Return{}, false
+			}
 			if r.MessageId == messageID {
 				return r, true
 			}

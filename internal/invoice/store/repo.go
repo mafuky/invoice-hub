@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"slices"
 	"time"
 
 	"github.com/go-sql-driver/mysql"
@@ -25,6 +26,7 @@ type DBTX interface {
 const (
 	EntityInvoice = "invoice"
 	EntityTask    = "task"
+	EntityCommand = "command"
 )
 
 type Repo struct {
@@ -255,12 +257,21 @@ func (r *Repo) ListTimedOutTasks(ctx context.Context, now time.Time, limit int) 
 
 // GetCommand loads one command; it returns domain.ErrNotFound when the id is unknown.
 func (r *Repo) GetCommand(ctx context.Context, q DBTX, id int64) (domain.Command, error) {
+	return r.getCommand(ctx, q, id, "")
+}
+
+// GetCommandForUpdate locks the command until its lifecycle change commits.
+func (r *Repo) GetCommandForUpdate(ctx context.Context, tx *sql.Tx, id int64) (domain.Command, error) {
+	return r.getCommand(ctx, tx, id, " FOR UPDATE")
+}
+
+func (r *Repo) getCommand(ctx context.Context, q DBTX, id int64, lock string) (domain.Command, error) {
 	var (
 		c      domain.Command
 		status string
 	)
-	err := q.QueryRowContext(ctx, `SELECT id, invoice_id, kind, status, reason FROM commands WHERE id = ?`, id).
-		Scan(&c.ID, &c.InvoiceID, &c.Kind, &status, &c.Reason)
+	err := q.QueryRowContext(ctx, `SELECT id, invoice_id, kind, status, reason, version FROM commands WHERE id = ?`+lock, id).
+		Scan(&c.ID, &c.InvoiceID, &c.Kind, &status, &c.Reason, &c.Version)
 	if errors.Is(err, sql.ErrNoRows) {
 		return domain.Command{}, fmt.Errorf("command %d: %w", id, domain.ErrNotFound)
 	}
@@ -269,6 +280,30 @@ func (r *Repo) GetCommand(ctx context.Context, q DBTX, id int64) (domain.Command
 	}
 	c.Status = domain.CommandStatus(status)
 	return c, nil
+}
+
+// TransitionCommand changes an allowed command state at the expected version
+// and records its cause in the caller's transaction. A stale state or version
+// returns false without writing anything.
+func (r *Repo) TransitionCommand(ctx context.Context, tx *sql.Tx, id int64, from, to domain.CommandStatus, version int, cause, eventID string) (bool, error) {
+	if !slices.Contains(domain.CommandTransitions[from], to) {
+		return false, fmt.Errorf("command %d: illegal transition %s -> %s", id, from, to)
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE commands SET status = ?, version = version + 1 WHERE id = ? AND status = ? AND version = ?`, to, id, from, version)
+	if err != nil {
+		return false, fmt.Errorf("store: transition command %d: %w", id, err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("store: command rows affected: %w", err)
+	}
+	if n == 0 {
+		return false, nil
+	}
+	if err := r.AppendStateLog(ctx, tx, EntityCommand, id, string(from), string(to), cause, eventID); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // AppendStateLog writes a state_log row without changing any entity, for

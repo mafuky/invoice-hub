@@ -6,9 +6,11 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/mafuky/invoice-hub/internal/platform/event"
+	"github.com/mafuky/invoice-hub/internal/platform/outbox"
 	"github.com/mafuky/invoice-hub/internal/platform/testenv"
 )
 
@@ -20,6 +22,89 @@ func deliveredEnvelope(t *testing.T) event.Envelope {
 		t.Fatal(err)
 	}
 	return env
+}
+
+func writeEffects(ctx context.Context, tx *sql.Tx, env event.Envelope) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO invoices (biz_order_no,product_line,title,tax_no,amount,customer_id,status) VALUES (?,'HOTEL','Example Travel Co., Ltd.','91310000EXAMPLE001','100.10','CUST-0002','applying')`, testenv.BizOrderNo()); err != nil {
+		return err
+	}
+	return outbox.Insert(ctx, tx, env.Type, env)
+}
+
+func assertEffects(t *testing.T, db *sql.DB, env event.Envelope, want int) {
+	t.Helper()
+	var invoices int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM invoices`).Scan(&invoices); err != nil {
+		t.Fatal(err)
+	}
+	if invoices != want {
+		t.Fatalf("business invoices=%d want=%d", invoices, want)
+	}
+	for _, table := range []string{"outbox", "processed_events"} {
+		var n int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM `+table+` WHERE event_id=?`, env.EventID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != want {
+			t.Fatalf("%s=%d want=%d", table, n, want)
+		}
+	}
+}
+
+func TestHandle_FnFailureRollsBackEffectsAndMarker(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "invoice")
+	env := deliveredEnvelope(t)
+	boom := errors.New("business write failed")
+	dup, err := Handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error {
+		if err := writeEffects(ctx, tx, env); err != nil {
+			return err
+		}
+		return boom
+	})
+	if dup || !errors.Is(err, boom) {
+		t.Fatalf("duplicate=%v err=%v", dup, err)
+	}
+	assertEffects(t, db, env, 0)
+	dup, err = Handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error { return writeEffects(ctx, tx, env) })
+	if dup || err != nil {
+		t.Fatalf("retry duplicate=%v err=%v", dup, err)
+	}
+	assertEffects(t, db, env, 1)
+}
+
+func TestHandle_ConcurrentDuplicateAppliesOnce(t *testing.T) {
+	ctx := context.Background()
+	db := testenv.OpenMySQL(t, "invoice")
+	env := deliveredEnvelope(t)
+	const n = 10
+	dups := make([]bool, n)
+	errs := make([]error, n)
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			dups[i], errs[i] = Handle(ctx, db, "invoice-svc", env, func(tx *sql.Tx) error { return writeEffects(ctx, tx, env) })
+		}()
+	}
+	close(start)
+	wg.Wait()
+	first := 0
+	for i, err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !dups[i] {
+			first++
+		}
+	}
+	if first != 1 {
+		t.Fatalf("nonduplicates=%d", first)
+	}
+	assertEffects(t, db, env, 1)
 }
 
 func TestHandle_DuplicateSkipsFn(t *testing.T) {

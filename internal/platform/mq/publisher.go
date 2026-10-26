@@ -69,6 +69,9 @@ func (p *Publisher) Publish(ctx context.Context, routingKey string, env event.En
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	drainReturns(p.returns)
+	if p.ch.IsClosed() {
+		return fmt.Errorf("mq: publish %s: %w", routingKey, amqp.ErrClosed)
+	}
 
 	dc, err := p.ch.PublishWithDeferredConfirmWithContext(ctx, p.exchange, routingKey, true, false, amqp.Publishing{
 		ContentType:  "application/json",

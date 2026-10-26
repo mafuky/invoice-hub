@@ -187,17 +187,17 @@ func mongoSandbox(t *testing.T) (context.Context, *mongo.Database, string) {
 		t.Skipf("mongo unavailable: %v", err)
 	}
 	prefix := "t" + runID() + "_"
-	if err := ensureIndexes(ctx, db, prefix); err != nil {
-		t.Fatalf("ensure indexes: %v", err)
-	}
 	t.Cleanup(func() {
 		dctx, c := context.WithTimeout(context.Background(), arrivalTimeout)
 		defer c()
-		for _, n := range []string{"callbacks", "deliveries", "outbox", "processed_events"} {
+		for _, n := range []string{"callbacks", "deliveries", "outbox", "processed_events", "delivery_invoices"} {
 			_ = db.Collection(prefix + n).Drop(dctx)
 		}
 		_ = db.Client().Disconnect(dctx)
 	})
+	if err := ensureIndexes(ctx, db, prefix); err != nil {
+		t.Fatalf("ensure indexes: %v", err)
+	}
 	return ctx, db, prefix
 }
 
@@ -215,6 +215,28 @@ func TestMongoIndexes_UniqueCallbackRejectsDuplicate(t *testing.T) {
 	_, err := c.InsertOne(ctx, bson.D{{Key: "supplier", Value: "s1"}, {Key: "supplier_order_no", Value: "o1"}, {Key: "event_seq", Value: 1}})
 	if !mongo.IsDuplicateKeyError(err) {
 		t.Fatalf("want duplicate key error, got %v", err)
+	}
+}
+
+func TestMongoSandbox_CleansAllCollections(t *testing.T) {
+	ctx, db, _ := mongoSandbox(t)
+	var prefix string
+	t.Run("sandbox", func(t *testing.T) {
+		_, _, prefix = mongoSandbox(t)
+		names, err := db.ListCollectionNames(ctx, bson.D{{Key: "name", Value: bson.D{{Key: "$regex", Value: "^" + prefix}}}})
+		if err != nil || len(names) != 5 {
+			t.Fatalf("sandbox collections = %v, %v", names, err)
+		}
+	})
+	if prefix == "" {
+		t.Fatal("child sandbox did not run")
+	}
+	names, err := db.ListCollectionNames(ctx, bson.D{{Key: "name", Value: bson.D{{Key: "$regex", Value: "^" + prefix}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(names) != 0 {
+		t.Fatalf("collections left after child cleanup: %v", names)
 	}
 }
 

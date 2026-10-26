@@ -54,11 +54,14 @@ message ListReply {
   string next_page_token = 2;
 }
 
+// Accepted only for a closed invoice; other states are refused with no writes.
 message RedFlushRequest {
   int64 invoice_id = 1;
   string reason = 2;
 }
 
+// Accepted only for a closed invoice; other states are refused with no writes.
+// The replacement reuses the existing invoice details.
 message ReissueRequest {
   int64 invoice_id = 1;
   string reason = 2;

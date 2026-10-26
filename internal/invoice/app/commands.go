@@ -9,12 +9,14 @@ import (
 	"fmt"
 )
 
-// RedFlush starts the red flush of an issued invoice: it records a RED_FLUSH
+// RedFlush starts the red flush of a closed invoice: it records a RED_FLUSH
 // command and a task that asks the supplier to cancel the invoice with an
 // offsetting negative one. It returns the command id.
 //
-// Invariant: only an issued invoice can be red flushed, and an invoice gets at
-// most one red flush that is not yet finished.
+// Invariant: only a closed invoice is accepted; other states are refused with
+// no writes. An invoice has at most one active red command (RED_FLUSH or REISSUE);
+// another request while one is active is refused with no writes.
+// Settlement adjustment for red-flushed invoices is not modeled.
 //
 // A red flush of an invoice that was never issued, or one that runs twice,
 // leaves finance with a negative entry that has no invoice behind it.
@@ -22,8 +24,10 @@ func (s *Service) RedFlush(ctx context.Context, invoiceID int64, reason string) 
 	return 0, fmt.Errorf("lesson 9: %w", errors.ErrUnsupported)
 }
 
-// Reissue handles a re-booked trip: the old invoice is red flushed and a new
-// invoice for the changed amount or details is issued. It returns the command id.
+// Reissue red flushes a closed invoice and requests a replacement using its
+// existing product line, title, tax number, amount and customer; the API carries
+// no new details. It returns the command id. Other invoice states or an active
+// RED_FLUSH/REISSUE command are refused with no writes.
 //
 // Invariant: the new invoice is requested only after the old one has been
 // red flushed, and exactly one new invoice results from one reissue command.
@@ -60,6 +64,7 @@ var ErrBizOrderExists = errors.New("biz_order_no already has an invoice")
 // Invariant: a command has at most one live task at a time, and the new task
 // together with its invoice.task.created outbox event is written in the
 // caller's transaction tx.
+// Replaying the failed attempt returns the existing live task's id without writes.
 //
 // If the replacement is never created the invoice sits in issuing forever; if
 // two live tasks exist, two suppliers are asked at once and the same trip is
@@ -72,7 +77,9 @@ func (s *Service) Reopen(ctx context.Context, tx *sql.Tx, invoiceID, commandID, 
 // has been red flushed: an invoice for the same trip under a biz_order_no made
 // from the old one plus "-R<n>", with its own ISSUE command, pending task and
 // invoice.task.created outbox event, all in the caller's transaction tx. It
-// returns the new invoice's id.
+// returns the new invoice's id, including on replay of the same command.
+// The replacement copies the old invoice's product line, title, tax number,
+// amount and customer, since the reissue request carries no new details.
 //
 // Invariant: one reissue command yields exactly one replacement invoice, and
 // the old invoice ends red_flushed.

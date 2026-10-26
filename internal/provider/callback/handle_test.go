@@ -5,6 +5,7 @@ package callback
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -15,6 +16,7 @@ import (
 	"github.com/redis/go-redis/v9"
 
 	"github.com/mafuky/invoice-hub/internal/platform/config"
+	"github.com/mafuky/invoice-hub/internal/platform/event"
 	"github.com/mafuky/invoice-hub/internal/platform/mq"
 	"github.com/mafuky/invoice-hub/internal/platform/testenv"
 	"github.com/mafuky/invoice-hub/internal/provider/lock"
@@ -39,6 +41,48 @@ func openRedis(t *testing.T) *redis.Client {
 		t.Skipf("redis unavailable: %v", err)
 	}
 	return rdb
+}
+
+func TestHandle_RawAlreadyStoredStillAppliesFirstOutcome(t *testing.T) {
+	db := testenv.OpenMySQL(t, "provider")
+	h := NewHandler(db, store.NewRepo(db), lock.New(openRedis(t)))
+	order := submittedOrder(t, db)
+	cb := Callback{Supplier: order.Supplier, SupplierOrderNo: order.SupplierOrderNo, EventSeq: 1, Outcome: OutcomeSucceeded, InvoiceNo: "AIR-A-12345678", RawInserted: false}
+	var firstBody string
+	for i, want := range []Result{Accepted, Duplicate} {
+		res, err := h.Handle(context.Background(), cb)
+		if err != nil || res != want {
+			t.Fatalf("call %d: %v %v", i, res, err)
+		}
+		got := reload(t, db, order)
+		if got.Status != store.StatusSucceeded || got.InvoiceNo != cb.InvoiceNo || got.LastEventSeq != 1 || got.Version != order.Version+1 {
+			t.Fatalf("order=%+v", got)
+		}
+		keys := outboxKeys(t, db, order)
+		if len(keys) != 1 || keys[0] != mq.ProviderTaskSucceeded {
+			t.Fatalf("keys=%v", keys)
+		}
+		var body []byte
+		if err := db.QueryRow(`SELECT body FROM outbox WHERE JSON_EXTRACT(body,'$.payload.task_id')=?`, order.TaskID).Scan(&body); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			firstBody = string(body)
+		} else if string(body) != firstBody {
+			t.Fatal("duplicate rewrote the outbox event")
+		}
+		var env event.Envelope
+		if err := json.Unmarshal(body, &env); err != nil {
+			t.Fatal(err)
+		}
+		var out event.TaskOutcome
+		if err := env.Decode(&out); err != nil {
+			t.Fatal(err)
+		}
+		if env.Type != mq.ProviderTaskSucceeded || env.EventID == "" || out.TaskID != order.TaskID || out.InvoiceID != order.InvoiceID || out.Supplier != order.Supplier || out.SupplierOrderNo != order.SupplierOrderNo || out.InvoiceNo != cb.InvoiceNo || out.Reason != "" {
+			t.Fatalf("envelope=%+v outcome=%+v", env, out)
+		}
+	}
 }
 
 // submittedOrder seeds an order the supplier has accepted and is yet to call back about.

@@ -139,7 +139,11 @@ func (r *Repo) WithTx(ctx context.Context, fn func(ctx context.Context) error) e
 // when the same invoice version is already recorded for the channel.
 func (r *Repo) InsertPending(ctx context.Context, nd NewDelivery) (inserted bool, err error) {
 	now := time.Now().UTC()
-	_, err = r.deliveries.InsertOne(ctx, Delivery{
+	res, err := r.deliveries.UpdateOne(ctx, bson.D{
+		{Key: "invoice_id", Value: nd.InvoiceID},
+		{Key: "invoice_version", Value: nd.InvoiceVersion},
+		{Key: "channel", Value: nd.Channel},
+	}, bson.D{{Key: "$setOnInsert", Value: Delivery{
 		ID:             bson.NewObjectID(),
 		InvoiceID:      nd.InvoiceID,
 		InvoiceVersion: nd.InvoiceVersion,
@@ -151,14 +155,11 @@ func (r *Repo) InsertPending(ctx context.Context, nd NewDelivery) (inserted bool
 		NextRetryAt:    now,
 		CreatedAt:      now,
 		UpdatedAt:      now,
-	})
-	if mongo.IsDuplicateKeyError(err) {
-		return false, nil
-	}
+	}}}, options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		return false, fmt.Errorf("store: insert delivery of invoice %d v%d to %s: %w", nd.InvoiceID, nd.InvoiceVersion, nd.Channel, err)
 	}
-	return true, nil
+	return res.UpsertedCount == 1, nil
 }
 
 // Get returns one delivery by id.
@@ -401,16 +402,13 @@ func RequireTransactions(ctx context.Context, db *mongo.Database) error {
 
 // MarkProcessed records an event id and reports first=false when it was seen before.
 func (r *Repo) MarkProcessed(ctx context.Context, eventID string) (first bool, err error) {
-	_, err = r.processed.InsertOne(ctx, bson.D{
+	res, err := r.processed.UpdateOne(ctx, bson.D{{Key: "event_id", Value: eventID}}, bson.D{{Key: "$setOnInsert", Value: bson.D{
 		{Key: "event_id", Value: eventID},
 		{Key: "consumer", Value: "delivery-svc"},
 		{Key: "processed_at", Value: time.Now().UTC()},
-	})
-	if mongo.IsDuplicateKeyError(err) {
-		return false, nil
-	}
+	}}}, options.UpdateOne().SetUpsert(true))
 	if err != nil {
 		return false, fmt.Errorf("store: mark event %s processed: %w", eventID, err)
 	}
-	return true, nil
+	return res.UpsertedCount == 1, nil
 }
